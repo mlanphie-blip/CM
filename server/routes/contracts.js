@@ -94,6 +94,7 @@ router.post('/', authenticate, requireRole('admin', 'editor'), upload.single('fi
       extractedText = await extractTextFromFile(req.file.path, fileType);
     } catch (err) {
       console.error('Text extraction error:', err.message);
+      extractedText = { text: '', html: null, type: fileType };
     }
   }
 
@@ -112,8 +113,16 @@ router.post('/', authenticate, requireRole('admin', 'editor'), upload.single('fi
 
   const contractId = result.lastInsertRowid;
 
-  // Parse and insert sections
-  const sections = manualSections.length > 0 ? manualSections : parseTextIntoSections(extractedText);
+  // Parse and insert sections — prefer HTML-based parsing for DOCX, fall back to text
+  let sections;
+  if (manualSections.length > 0) {
+    sections = manualSections;
+  } else if (extractedText.html) {
+    sections = parseSectionsFromHtml(extractedText.html) || parseTextIntoSections(extractedText.text);
+  } else {
+    sections = parseTextIntoSections(extractedText.text || (typeof extractedText === 'string' ? extractedText : ''));
+  }
+
   const insertSection = db.prepare(`
     INSERT INTO contract_sections (contract_id, section_number, title, content, sort_order)
     VALUES (?, ?, ?, ?, ?)
@@ -124,7 +133,7 @@ router.post('/', authenticate, requireRole('admin', 'editor'), upload.single('fi
   }
 
   // Create initial version
-  const fullText = sections.map(s => `${s.number || i + 1}. ${s.title || ''}\n${s.content}`).join('\n\n');
+  const fullText = sections.map((s, i) => `${s.number || i + 1}. ${s.title || ''}\n${s.content}`).join('\n\n');
   db.prepare(`
     INSERT INTO contract_versions (contract_id, version_number, version_label, change_summary, full_text, sections_snapshot, created_by)
     VALUES (?, 1, 'Original', 'Initial version', ?, ?, ?)
@@ -298,49 +307,288 @@ router.delete('/:id', authenticate, requireRole('admin'), (req, res) => {
 });
 
 // Helper: extract text from uploaded files
+// For DOCX we extract structured HTML to preserve headings, then fall back to raw text for PDF/TXT
 async function extractTextFromFile(filePath, fileType) {
   if (fileType === 'pdf') {
     const pdfParse = require('pdf-parse');
     const buffer = fs.readFileSync(filePath);
     const data = await pdfParse(buffer);
-    return data.text;
+    return { text: data.text, html: null, type: 'pdf' };
   } else if (fileType === 'docx' || fileType === 'doc') {
     const mammoth = require('mammoth');
-    const result = await mammoth.extractRawText({ path: filePath });
-    return result.value;
+    // Get both HTML (preserves heading styles) and raw text
+    const [htmlResult, textResult] = await Promise.all([
+      mammoth.convertToHtml({ path: filePath }),
+      mammoth.extractRawText({ path: filePath })
+    ]);
+    return { text: textResult.value, html: htmlResult.value, type: 'docx' };
   } else if (fileType === 'txt') {
-    return fs.readFileSync(filePath, 'utf-8');
+    return { text: fs.readFileSync(filePath, 'utf-8'), html: null, type: 'txt' };
   }
-  return '';
+  return { text: '', html: null, type: fileType };
 }
 
-// Helper: parse raw text into sections
+// ---- Section Parsing Engine ----
+
+// For DOCX: parse the HTML output to detect headings (h1-h6, <strong> blocks) as section boundaries
+function parseSectionsFromHtml(html) {
+  const sections = [];
+  // Split on heading tags — mammoth converts Word heading styles to h1-h6
+  // Also treat standalone <p><strong>TEXT</strong></p> as a heading (common Word pattern)
+  const parts = html.split(/(<h[1-6][^>]*>[\s\S]*?<\/h[1-6]>|<p>\s*<strong>[^<]{1,200}<\/strong>\s*<\/p>)/i);
+
+  let pendingHeading = null;
+  let sectionCounter = 0;
+
+  for (const part of parts) {
+    const trimmed = part.trim();
+    if (!trimmed) continue;
+
+    // Check if this part is a heading
+    const headingMatch = trimmed.match(/<h[1-6][^>]*>([\s\S]*?)<\/h[1-6]>/i);
+    const boldHeadingMatch = !headingMatch && trimmed.match(/^<p>\s*<strong>([^<]{1,200})<\/strong>\s*<\/p>$/i);
+
+    if (headingMatch || boldHeadingMatch) {
+      // This is a heading — start a new section
+      const rawTitle = (headingMatch ? headingMatch[1] : boldHeadingMatch[1])
+        .replace(/<[^>]+>/g, '').trim();
+      if (!rawTitle) continue;
+
+      const parsed = parseNumberFromTitle(rawTitle);
+      sectionCounter++;
+      pendingHeading = {
+        number: parsed.number || String(sectionCounter),
+        title: parsed.title,
+        content: ''
+      };
+      sections.push(pendingHeading);
+    } else {
+      // This is body content — strip HTML tags and attach to current section
+      const plainText = stripHtml(trimmed);
+      if (!plainText.trim()) continue;
+
+      if (pendingHeading) {
+        pendingHeading.content += (pendingHeading.content ? '\n' : '') + plainText.trim();
+      } else {
+        // Content before any heading — create Preamble
+        sectionCounter++;
+        pendingHeading = { number: '0', title: 'Preamble', content: plainText.trim() };
+        sections.push(pendingHeading);
+      }
+    }
+  }
+
+  return sections.length > 0 ? sections : null; // null = fall through to text parser
+}
+
+function stripHtml(html) {
+  return html
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/<\/p>\s*<p[^>]*>/gi, '\n')
+    .replace(/<\/li>\s*/gi, '\n')
+    .replace(/<li[^>]*>/gi, '  - ')
+    .replace(/<[^>]+>/g, '')
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&nbsp;/g, ' ')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
+// For plain text (PDF / TXT): use multiple pattern strategies to detect section headers
 function parseTextIntoSections(text) {
   if (!text || !text.trim()) return [{ number: '1', title: 'Main Content', content: text || '' }];
 
-  const lines = text.split('\n');
+  // Normalize line endings and collapse excessive blank lines
+  const normalized = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n').replace(/\n{4,}/g, '\n\n\n');
+  const lines = normalized.split('\n');
+
+  // --- Pattern definitions (ordered by specificity) ---
+  const patterns = [
+    // "ARTICLE I" / "ARTICLE 1" / "Article I." / "Article One"
+    { regex: /^(ARTICLE|Article)\s+([IVXLCDM]+|\d+)\.?\s*[-–—:]?\s*(.*)$/i, type: 'article' },
+    // "SECTION 1.1" / "Section 3" / "SECTION 10.2.1"
+    { regex: /^(SECTION|Section)\s+(\d+(?:\.\d+)*)\.?\s*[-–—:]?\s*(.*)$/i, type: 'section' },
+    // "EXHIBIT A" / "SCHEDULE 1" / "APPENDIX B" / "ANNEX 1"
+    { regex: /^(EXHIBIT|SCHEDULE|APPENDIX|ANNEX|ATTACHMENT)\s+([A-Z0-9]+)\.?\s*[-–—:]?\s*(.*)$/i, type: 'exhibit' },
+    // Numbered: "1." / "1.1" / "1.1.1" / "12.3" — must be at start of line
+    { regex: /^(\d{1,3}(?:\.\d{1,3}){0,4})\.?\s+([A-Z].{0,200})$/, type: 'numbered' },
+    // Lettered subsections: "(a)" / "(b)" / "(i)" / "(ii)" — only top-level letters
+    { regex: /^\(([a-z]|[ivx]+)\)\s+(.+)$/, type: 'lettered' },
+    // Roman numeral sections: "I." / "II." / "III." / "IV." at start of line with title
+    { regex: /^([IVXLCDM]{1,6})\.?\s+((?:[A-Z][A-Za-z]*\s*){1,10}.*)$/, type: 'roman' },
+    // ALL-CAPS lines (single word 5+ chars or multi-word, max 120 chars) — common for contract headers
+    { regex: /^([A-Z][A-Z\s,&\-/]{3,120})$/, type: 'allcaps' },
+    // "RECITALS" / "WHEREAS" / "NOW, THEREFORE" / "DEFINITIONS" / "WITNESSETH"
+    { regex: /^(RECITALS?|WHEREAS|NOW,?\s*THEREFORE|DEFINITIONS?|WITNESSETH|PREAMBLE|BACKGROUND|TERMS AND CONDITIONS|INDEMNIFICATION|INDEMNITY|CONFIDENTIALITY|MISCELLANEOUS|REPRESENTATIONS|WARRANTIES|COVENANTS|GOVERNING LAW|NOTICES|INSURANCE|FORCE MAJEURE|ASSIGNMENT|SEVERABILITY|AMENDMENTS?|ENTIRE AGREEMENT|COUNTERPARTS|WAIVER|ARBITRATION|DISPUTE RESOLUTION|TERMINATION|INTELLECTUAL PROPERTY)\s*:?\s*$/i, type: 'keyword' },
+  ];
+
+  // First pass: identify which lines are headers
+  const lineClassifications = lines.map((line, idx) => {
+    const trimmed = line.trim();
+    if (!trimmed) return { line: trimmed, isHeader: false, idx };
+
+    for (const p of patterns) {
+      const match = trimmed.match(p.regex);
+      if (match) {
+        // Extra validation for all-caps: skip if it looks like a regular sentence
+        if (p.type === 'allcaps') {
+          const wordCount = trimmed.split(/\s+/).length;
+          if (wordCount > 15) continue;
+          // Single all-caps word must be at least 5 chars (avoids matching "THE", "AND" etc.)
+          if (wordCount === 1 && trimmed.length < 5) continue;
+          if (trimmed.endsWith('.') && wordCount > 8) continue;
+        }
+        // Extra validation for numbered: the title part should start with uppercase
+        if (p.type === 'numbered') {
+          if (!match[2] || match[2].trim().length < 2) continue;
+        }
+        // Extra validation for roman numerals: must be a valid Roman numeral
+        if (p.type === 'roman') {
+          if (!isValidRoman(match[1])) continue;
+        }
+        return { line: trimmed, isHeader: true, type: p.type, match, idx };
+      }
+    }
+    return { line: trimmed, isHeader: false, idx };
+  });
+
+  // Check if we found a reasonable number of headers
+  const headers = lineClassifications.filter(l => l.isHeader);
+  if (headers.length === 0) {
+    // No headers detected — split by double-newline paragraphs instead
+    return splitByParagraphs(normalized);
+  }
+
+  // For all-caps-only detection: require at least 2 all-caps headers to avoid false positives
+  const nonAllcapsHeaders = headers.filter(h => h.type !== 'allcaps');
+  const onlyAllcaps = nonAllcapsHeaders.length === 0;
+  if (onlyAllcaps && headers.length < 2) {
+    return splitByParagraphs(normalized);
+  }
+
+  // Second pass: build sections from classified lines
   const sections = [];
   let currentSection = null;
-  const sectionPattern = /^(\d+(?:\.\d+)*)[.\s)]\s*(.+)/;
 
-  for (const line of lines) {
-    const match = line.match(sectionPattern);
-    if (match && match[2].trim().length > 0 && match[2].trim().length < 200) {
-      if (currentSection) sections.push(currentSection);
-      currentSection = { number: match[1], title: match[2].trim(), content: '' };
-    } else if (currentSection) {
-      currentSection.content += (currentSection.content ? '\n' : '') + line;
+  for (const cl of lineClassifications) {
+    if (cl.isHeader) {
+      if (currentSection) {
+        currentSection.content = currentSection.content.trim();
+        sections.push(currentSection);
+      }
+      const parsed = parseHeaderInfo(cl);
+      currentSection = { number: parsed.number, title: parsed.title, content: '' };
     } else {
-      currentSection = { number: '1', title: 'Preamble', content: line };
+      if (cl.line === '' && currentSection) {
+        currentSection.content += '\n';
+      } else if (cl.line) {
+        if (currentSection) {
+          currentSection.content += (currentSection.content.endsWith('\n') || !currentSection.content ? '' : '\n') + cl.line;
+        } else {
+          // Content before any header — Preamble
+          currentSection = { number: '0', title: 'Preamble', content: cl.line };
+        }
+      }
     }
   }
-  if (currentSection) sections.push(currentSection);
-
-  if (sections.length === 0) {
-    sections.push({ number: '1', title: 'Main Content', content: text });
+  if (currentSection) {
+    currentSection.content = currentSection.content.trim();
+    sections.push(currentSection);
   }
 
-  return sections;
+  // Renumber sections sequentially if numbers are missing
+  let autoNum = 0;
+  for (const s of sections) {
+    if (!s.number || s.number === '0') {
+      autoNum++;
+      s.number = String(autoNum);
+    } else {
+      autoNum++;
+    }
+  }
+
+  return sections.length > 0 ? sections : [{ number: '1', title: 'Main Content', content: text }];
+}
+
+// Fallback: split plain text into sections by paragraph breaks when no headers are detected
+function splitByParagraphs(text) {
+  const paragraphs = text.split(/\n\s*\n/).map(p => p.trim()).filter(Boolean);
+  if (paragraphs.length <= 1) {
+    return [{ number: '1', title: 'Main Content', content: text.trim() }];
+  }
+  // Try to use the first line of each paragraph as a title if it's short enough
+  return paragraphs.map((para, i) => {
+    const lines = para.split('\n');
+    const firstLine = lines[0].trim();
+    // If first line is short and looks like a title, use it
+    if (firstLine.length < 100 && lines.length > 1) {
+      return { number: String(i + 1), title: firstLine, content: lines.slice(1).join('\n').trim() };
+    }
+    return { number: String(i + 1), title: `Section ${i + 1}`, content: para };
+  });
+}
+
+function parseHeaderInfo(classification) {
+  const { type, match, line } = classification;
+  switch (type) {
+    case 'article': {
+      const num = match[2];
+      const title = match[3]?.trim() || `Article ${num}`;
+      return { number: `Art. ${num}`, title };
+    }
+    case 'section': {
+      return { number: match[2], title: match[3]?.trim() || `Section ${match[2]}` };
+    }
+    case 'exhibit': {
+      return { number: `${match[1]} ${match[2]}`, title: match[3]?.trim() || `${match[1]} ${match[2]}` };
+    }
+    case 'numbered': {
+      return { number: match[1], title: match[2]?.trim() || '' };
+    }
+    case 'lettered': {
+      return { number: `(${match[1]})`, title: match[2]?.trim() || '' };
+    }
+    case 'roman': {
+      return { number: match[1], title: match[2]?.trim() || '' };
+    }
+    case 'allcaps': {
+      return { number: '', title: toTitleCase(match[1].trim()) };
+    }
+    case 'keyword': {
+      return { number: '', title: toTitleCase(match[1].trim()) };
+    }
+    default:
+      return { number: '', title: line };
+  }
+}
+
+function parseNumberFromTitle(rawTitle) {
+  // Try to extract "ARTICLE I - Title" or "Section 1.2 - Title" or "1. Title" from heading text
+  // Check for explicit keywords first
+  const articleMatch = rawTitle.match(/^(?:ARTICLE|Article)\s+([IVXLCDM]+|\d+)\.?\s*[-–—:]?\s*(.*)$/);
+  if (articleMatch) return { number: `Art. ${articleMatch[1]}`, title: articleMatch[2].trim() || rawTitle };
+
+  const sectionMatch = rawTitle.match(/^(?:SECTION|Section)\s+(\d+(?:\.\d+)*)\.?\s*[-–—:]?\s*(.*)$/);
+  if (sectionMatch) return { number: sectionMatch[1], title: sectionMatch[2].trim() || rawTitle };
+
+  // Plain number: "1." or "1.2" at start
+  const numMatch = rawTitle.match(/^(\d+(?:\.\d+)*)\.?\s*[-–—:]?\s*(.+)$/);
+  if (numMatch) return { number: numMatch[1], title: numMatch[2].trim() };
+
+  // No number detected — use title as-is
+  return { number: '', title: rawTitle };
+}
+
+function isValidRoman(str) {
+  return /^(M{0,4})(CM|CD|D?C{0,3})(XC|XL|L?X{0,3})(IX|IV|V?I{0,3})$/.test(str) && str.length > 0;
+}
+
+function toTitleCase(str) {
+  return str.toLowerCase().replace(/(?:^|\s|[-/])\S/g, c => c.toUpperCase());
 }
 
 module.exports = router;
