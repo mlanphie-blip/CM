@@ -1097,4 +1097,86 @@ function toTitleCase(str) {
   return str.toLowerCase().replace(/(?:^|\s|[-/])\S/g, c => c.toUpperCase());
 }
 
+// Re-parse a single DOCX contract's sections in the database using the latest parser
+async function reparseContract(contractId) {
+  const db = getDb();
+  const contract = db.prepare('SELECT * FROM contracts WHERE id = ?').get(contractId);
+  if (!contract || !contract.file_path || contract.file_type !== 'docx') {
+    return { success: false, reason: 'Not a DOCX contract' };
+  }
+
+  const fullPath = path.join(__dirname, '..', 'uploads', contract.file_path);
+  if (!fs.existsSync(fullPath)) {
+    return { success: false, reason: 'File not found: ' + fullPath };
+  }
+
+  let sections = await parseSectionsFromDocxXml(fullPath);
+  if (!sections || sections.length <= 1) {
+    // Fall back to HTML parser
+    try {
+      const mammoth = require('mammoth');
+      const htmlResult = await mammoth.convertToHtml({ path: fullPath });
+      sections = parseSectionsFromHtml(htmlResult.value);
+    } catch (err) {
+      console.error('[Reparse] HTML fallback failed for contract', contractId, err.message);
+    }
+  }
+
+  if (!sections || sections.length <= 1) {
+    return { success: false, reason: 'Parser returned too few sections' };
+  }
+
+  // Replace sections in the database
+  db.prepare('DELETE FROM contract_sections WHERE contract_id = ?').run(contractId);
+  const insertSection = db.prepare(`
+    INSERT INTO contract_sections (contract_id, section_number, title, content, sort_order)
+    VALUES (?, ?, ?, ?, ?)
+  `);
+  for (let i = 0; i < sections.length; i++) {
+    insertSection.run(contractId, sections[i].number || String(i + 1), sections[i].title || '', sections[i].content, i);
+  }
+
+  db.prepare('UPDATE contracts SET updated_at = CURRENT_TIMESTAMP WHERE id = ?').run(contractId);
+
+  return { success: true, sectionCount: sections.length };
+}
+
+// Re-parse ALL DOCX contracts in the database
+async function reparseAllDocxContracts() {
+  const db = getDb();
+  const contracts = db.prepare("SELECT id, title FROM contracts WHERE file_type = 'docx'").all();
+  if (contracts.length === 0) {
+    console.log('[Reparse] No DOCX contracts to re-parse.');
+    return;
+  }
+
+  console.log(`[Reparse] Re-parsing ${contracts.length} DOCX contract(s) with latest parser...`);
+  for (const c of contracts) {
+    const result = await reparseContract(c.id);
+    if (result.success) {
+      console.log(`[Reparse]   Contract #${c.id} "${c.title}": ${result.sectionCount} sections`);
+    } else {
+      console.log(`[Reparse]   Contract #${c.id} "${c.title}": SKIPPED (${result.reason})`);
+    }
+  }
+  console.log('[Reparse] Done.');
+}
+
+// API endpoint: POST /api/contracts/:id/reparse
+router.post('/:id/reparse', authenticate, requireRole('admin', 'editor'), async (req, res) => {
+  try {
+    const result = await reparseContract(req.params.id);
+    if (result.success) {
+      logAction(req.user.id, 'reparse_contract', 'contract', Number(req.params.id));
+      res.json({ message: `Re-parsed successfully: ${result.sectionCount} sections`, sectionCount: result.sectionCount });
+    } else {
+      res.status(400).json({ error: result.reason });
+    }
+  } catch (err) {
+    console.error('Reparse error:', err);
+    res.status(500).json({ error: 'Failed to re-parse: ' + err.message });
+  }
+});
+
 module.exports = router;
+module.exports.reparseAllDocxContracts = reparseAllDocxContracts;

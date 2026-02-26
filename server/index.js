@@ -50,8 +50,16 @@ if (process.env.NODE_ENV === 'production') {
   });
 }
 
-app.listen(PORT, () => {
+app.listen(PORT, async () => {
   console.log(`Contract Amendment Manager API running on port ${PORT}`);
+
+  // Auto-reparse all DOCX contracts on startup to apply any parser improvements
+  try {
+    const { reparseAllDocxContracts } = require('./routes/contracts');
+    await reparseAllDocxContracts();
+  } catch (err) {
+    console.error('[Startup] Auto-reparse failed:', err.message);
+  }
 });
 
 module.exports = app;
