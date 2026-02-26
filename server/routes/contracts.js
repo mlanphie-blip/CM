@@ -353,33 +353,41 @@ async function extractTextFromFile(filePath, fileType) {
 //   - Heading styles → <h1>-<h6>
 //   - Bold paragraphs → <p><strong>...</strong></p>
 //   - Multi-level numbered lists → nested <ol><li> (e.g. 1., 1.1., 1.2.1.)
-// For contracts, only top-level list items are sections; nested items are sub-clause content.
+// Each numbered clause becomes its own section so users can propose amendments
+// to individual clauses rather than entire top-level groupings.
 function parseSectionsFromHtml(html) {
-  const { parse } = require('node-html-parser');
+  let parse;
+  try {
+    parse = require('node-html-parser').parse;
+  } catch (err) {
+    console.error('node-html-parser not installed. Run: npm install node-html-parser');
+    return null;
+  }
+
   const root = parse(html);
   const sections = [];
-  let sectionCounter = 0;
   let pendingSection = null;
+
+  function pushSection(section) {
+    sections.push(section);
+    pendingSection = section;
+  }
 
   function appendContent(text) {
     if (!text.trim()) return;
     if (pendingSection) {
       pendingSection.content += (pendingSection.content ? '\n' : '') + text.trim();
     } else {
-      sectionCounter++;
-      pendingSection = { number: '0', title: 'Preamble', content: text.trim() };
-      sections.push(pendingSection);
+      pushSection({ number: '0', title: 'Preamble', content: text.trim() });
     }
   }
 
-  // Convert a DOM node (and all its children) to readable plain text,
-  // preserving sub-clause numbering for nested lists.
+  // Convert a DOM node to readable plain text, preserving sub-clause numbering.
   function nodeToText(node, numberPrefix) {
     if (node.nodeType === 3) return node.rawText; // text node
     const tag = (node.tagName || '').toLowerCase();
 
     if (tag === 'ol') {
-      // Numbered sub-list — render each <li> with its sub-clause number
       let text = '';
       let idx = 0;
       for (const child of node.childNodes) {
@@ -397,20 +405,120 @@ function parseSectionsFromHtml(html) {
       let text = '';
       for (const child of node.childNodes) {
         if ((child.tagName || '').toLowerCase() === 'li') {
-          const liText = nodeToText(child, numberPrefix);
-          text += `\n- ${liText.trim()}`;
+          text += `\n- ${nodeToText(child, numberPrefix).trim()}`;
         }
       }
       return text;
     }
 
-    // For <li> and other tags: recurse into children
     let text = '';
     for (const child of node.childNodes) {
       text += nodeToText(child, numberPrefix);
     }
     if (tag === 'p' || tag === 'br') text += '\n';
     return text;
+  }
+
+  // Get the first <strong>/<b> text from a <li>
+  function getLiBoldTitle(li) {
+    for (const child of li.childNodes) {
+      const childTag = (child.tagName || '').toLowerCase();
+      if (childTag === 'strong' || childTag === 'b') {
+        return child.textContent.trim().replace(/[.\s:]+$/, '');
+      }
+    }
+    return '';
+  }
+
+  // Get inline text from <li>, excluding bold titles and nested lists
+  function getLiInlineText(li) {
+    const parts = [];
+    for (const child of li.childNodes) {
+      const childTag = (child.tagName || '').toLowerCase();
+      if (childTag === 'ol' || childTag === 'ul' || childTag === 'strong' || childTag === 'b') continue;
+      const t = (child.nodeType === 3) ? child.rawText : child.textContent;
+      if (t.trim()) parts.push(t.trim());
+    }
+    return parts.join(' ');
+  }
+
+  // Find first nested <ol> or <ul> in a <li>
+  function getNestedList(li) {
+    for (const child of li.childNodes) {
+      const childTag = (child.tagName || '').toLowerCase();
+      if (childTag === 'ol' || childTag === 'ul') return child;
+    }
+    return null;
+  }
+
+  // Generate a short title from clause text (first line, max 80 chars)
+  function makeTitle(text) {
+    if (!text) return '';
+    const firstLine = text.split('\n')[0].trim();
+    if (firstLine.length <= 80) return firstLine;
+    return firstLine.substring(0, 77) + '...';
+  }
+
+  // Process a clause <li> — creates its own section.
+  // Any deeper nested lists are rendered as content text within this section.
+  function processClause(li, sectionNumber) {
+    const boldTitle = getLiBoldTitle(li);
+    const inlineText = getLiInlineText(li);
+    const nestedList = getNestedList(li);
+
+    const contentParts = [];
+    if (inlineText) contentParts.push(inlineText);
+    if (nestedList) {
+      contentParts.push(nodeToText(nestedList, sectionNumber).trim());
+    }
+
+    const content = contentParts.join('\n');
+    const title = boldTitle || makeTitle(inlineText || content);
+
+    pushSection({
+      number: sectionNumber,
+      title: title,
+      content: content
+    });
+  }
+
+  // Process a top-level <ol> — each <li> becomes one or more sections.
+  // If a <li> has a bold title AND a nested <ol>, the title becomes a heading
+  // section and each nested <li> becomes its own clause section.
+  function processTopLevelOl(ol) {
+    let topIdx = 0;
+    for (const li of ol.childNodes) {
+      if ((li.tagName || '').toLowerCase() !== 'li') continue;
+      topIdx++;
+
+      const boldTitle = getLiBoldTitle(li);
+      const nestedList = getNestedList(li);
+
+      if (boldTitle && nestedList && (nestedList.tagName || '').toLowerCase() === 'ol') {
+        // Major section: bold heading with numbered sub-items.
+        // Create a heading section, then individual sections for each sub-item.
+        const parsed = parseNumberFromTitle(boldTitle);
+        const sectionNum = parsed.number || String(topIdx);
+        const inlineText = getLiInlineText(li);
+
+        pushSection({
+          number: sectionNum,
+          title: parsed.title || boldTitle,
+          content: inlineText || ''
+        });
+
+        // Each sub-item becomes its own section
+        let subIdx = 0;
+        for (const subLi of nestedList.childNodes) {
+          if ((subLi.tagName || '').toLowerCase() !== 'li') continue;
+          subIdx++;
+          processClause(subLi, `${topIdx}.${subIdx}`);
+        }
+      } else {
+        // Simple clause without sub-structure — single section
+        processClause(li, String(topIdx));
+      }
+    }
   }
 
   // Walk the top-level children of the document
@@ -422,13 +530,11 @@ function parseSectionsFromHtml(html) {
       const rawTitle = node.textContent.trim();
       if (!rawTitle) continue;
       const parsed = parseNumberFromTitle(rawTitle);
-      sectionCounter++;
-      pendingSection = {
-        number: parsed.number || String(sectionCounter),
+      pushSection({
+        number: parsed.number || String(sections.length + 1),
         title: parsed.title,
         content: ''
-      };
-      sections.push(pendingSection);
+      });
       continue;
     }
 
@@ -443,13 +549,11 @@ function parseSectionsFromHtml(html) {
         const innerText = node.textContent.trim();
         if (innerText.length > 0 && innerText.length <= 200) {
           const parsed = parseNumberFromTitle(innerText);
-          sectionCounter++;
-          pendingSection = {
-            number: parsed.number || String(sectionCounter),
+          pushSection({
+            number: parsed.number || String(sections.length + 1),
             title: parsed.title,
             content: ''
-          };
-          sections.push(pendingSection);
+          });
           continue;
         }
       }
@@ -458,51 +562,9 @@ function parseSectionsFromHtml(html) {
       continue;
     }
 
-    // --- Ordered list: each direct <li> child is a top-level section ---
+    // --- Ordered list: expand into individual clause sections ---
     if (tag === 'ol') {
-      let topIdx = 0;
-      for (const li of node.childNodes) {
-        if ((li.tagName || '').toLowerCase() !== 'li') continue;
-        topIdx++;
-        sectionCounter++;
-
-        // Separate the bold title (if any) from the rest of the <li> content
-        let title = '';
-        let contentParts = [];
-
-        for (const child of li.childNodes) {
-          const childTag = (child.tagName || '').toLowerCase();
-          if ((childTag === 'strong' || childTag === 'b') && !title) {
-            // First bold element is the section title
-            title = child.textContent.trim().replace(/[.\s:]+$/, '');
-          } else if (childTag === 'ol' || childTag === 'ul') {
-            // Nested list — render as numbered sub-clauses
-            let subIdx = 0;
-            for (const subLi of child.childNodes) {
-              if ((subLi.tagName || '').toLowerCase() === 'li') {
-                subIdx++;
-                const subNum = `${topIdx}.${subIdx}`;
-                const subText = nodeToText(subLi, subNum);
-                contentParts.push(`${subNum}. ${subText.trim()}`);
-              }
-            }
-          } else {
-            // Plain text or other inline content
-            const text = (child.nodeType === 3) ? child.rawText : child.textContent;
-            if (text.trim()) contentParts.push(text.trim());
-          }
-        }
-
-        const content = contentParts.join('\n');
-        const parsed = title ? parseNumberFromTitle(title) : { number: '', title: '' };
-
-        pendingSection = {
-          number: parsed.number || String(topIdx),
-          title: parsed.title || title,
-          content: content
-        };
-        sections.push(pendingSection);
-      }
+      processTopLevelOl(node);
       continue;
     }
 
