@@ -337,40 +337,55 @@ async function extractTextFromFile(filePath, fileType) {
 
 // ---- Section Parsing Engine ----
 
-// For DOCX: parse the HTML output to detect headings (h1-h6, <strong>/<b> blocks) as section boundaries
+// For DOCX: parse the HTML output to detect headings (h1-h6, <strong>/<b> blocks)
+// and numbered list items (<ol><li>) as section boundaries.
+// Mammoth converts Word numbered lists to <ol><li> elements — each <li> is a contract clause.
 function parseSectionsFromHtml(html) {
   const sections = [];
-  // Split on heading tags — mammoth converts Word heading styles to h1-h6
-  // Also treat standalone bold paragraphs as headings (common Word pattern):
-  //   <p><strong>TEXT</strong></p>  or  <p><b>TEXT</b></p>
-  //   Handles nested tags inside bold, multiple bold spans in one <p>, and mixed <b>/<strong>
-  const parts = html.split(/(<h[1-6][^>]*>[\s\S]*?<\/h[1-6]>|<p>\s*(?:<(?:strong|b)[^>]*>[\s\S]{1,300}?<\/(?:strong|b)>\s*)+<\/p>)/i);
+  let sectionCounter = 0;
+
+  // Pre-process: extract <li> items from ordered lists into individual tokens.
+  // Mammoth outputs: <ol><li>clause 1</li><li>clause 2</li></ol>
+  // We need each <li> to be treated as a separate section.
+  // Replace <ol>...</ol> blocks by extracting each <li> as a standalone marker.
+  const preprocessed = html.replace(/<ol[^>]*>([\s\S]*?)<\/ol>/gi, (match, inner) => {
+    // Split out each <li>...</li> and wrap as a recognizable token
+    return inner.replace(/<li[^>]*>([\s\S]*?)<\/li>/gi, (liMatch, liContent) => {
+      return `<!--LI_SECTION-->${liContent}<!--/LI_SECTION-->`;
+    });
+  });
+
+  // Split on heading tags, bold-only paragraphs, and our LI_SECTION markers
+  const parts = preprocessed.split(
+    /(<h[1-6][^>]*>[\s\S]*?<\/h[1-6]>|<p>\s*(?:<(?:strong|b)[^>]*>[\s\S]{1,300}?<\/(?:strong|b)>\s*)+<\/p>|<!--LI_SECTION-->[\s\S]*?<!--\/LI_SECTION-->)/i
+  );
 
   let pendingHeading = null;
-  let sectionCounter = 0;
 
   for (const part of parts) {
     const trimmed = part.trim();
     if (!trimmed) continue;
 
-    // Check if this part is a heading
+    // Check: is this a heading tag (h1-h6)?
     const headingMatch = trimmed.match(/<h[1-6][^>]*>([\s\S]*?)<\/h[1-6]>/i);
-    // Bold heading: <p> containing only <strong>/<b> tags (no other text content outside the bold tags)
+
+    // Check: is this a bold-only paragraph?
     let boldHeadingMatch = null;
     if (!headingMatch) {
       const boldParagraph = trimmed.match(/^<p>\s*((?:<(?:strong|b)[^>]*>[\s\S]*?<\/(?:strong|b)>\s*)+)<\/p>$/i);
       if (boldParagraph) {
-        // Extract the text content from the bold tags
         const innerText = boldParagraph[1].replace(/<[^>]+>/g, '').trim();
-        // Only treat as heading if it's short enough (not a bold paragraph of body text)
         if (innerText.length > 0 && innerText.length <= 200) {
           boldHeadingMatch = [trimmed, innerText];
         }
       }
     }
 
+    // Check: is this a list item section?
+    const liMatch = trimmed.match(/^<!--LI_SECTION-->([\s\S]*?)<!--\/LI_SECTION-->$/);
+
     if (headingMatch || boldHeadingMatch) {
-      // This is a heading — start a new section
+      // Heading (h1-h6 or bold paragraph) — start a new section
       const rawTitle = (headingMatch ? headingMatch[1] : boldHeadingMatch[1])
         .replace(/<[^>]+>/g, '').trim();
       if (!rawTitle) continue;
@@ -383,8 +398,40 @@ function parseSectionsFromHtml(html) {
         content: ''
       };
       sections.push(pendingHeading);
+    } else if (liMatch) {
+      // Numbered list item — each is a separate clause/section
+      const liHtml = liMatch[1];
+      sectionCounter++;
+
+      // Check if the <li> starts with a bold title: <strong>TITLE.</strong> body text
+      const boldTitleMatch = liHtml.match(/^\s*<(?:strong|b)[^>]*>([\s\S]*?)<\/(?:strong|b)>\s*([\s\S]*)$/i);
+      let title, content;
+      if (boldTitleMatch) {
+        title = boldTitleMatch[1].replace(/<[^>]+>/g, '').trim().replace(/[.\s:]+$/, '');
+        content = stripHtml(boldTitleMatch[2]).trim();
+      } else {
+        // No bold title — use the full text, try to extract a title from the start
+        const fullText = stripHtml(liHtml).trim();
+        // Try to extract a short title before a period or colon
+        const titleSplit = fullText.match(/^([A-Z][^.]{2,80})[.:]?\s+([\s\S]*)$/);
+        if (titleSplit && titleSplit[1].length <= 80) {
+          title = titleSplit[1].replace(/[.\s:]+$/, '');
+          content = titleSplit[2];
+        } else {
+          title = '';
+          content = fullText;
+        }
+      }
+
+      const parsed = parseNumberFromTitle(title || content.substring(0, 60));
+      pendingHeading = {
+        number: parsed.number || String(sectionCounter),
+        title: title ? (parsed.title || title) : parsed.title,
+        content: content
+      };
+      sections.push(pendingHeading);
     } else {
-      // This is body content — strip HTML tags and attach to current section
+      // Body content — strip HTML and attach to current section
       const plainText = stripHtml(trimmed);
       if (!plainText.trim()) continue;
 
