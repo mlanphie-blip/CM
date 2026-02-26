@@ -125,7 +125,7 @@ router.post('/', authenticate, requireRole('admin', 'editor'), upload.single('fi
         sections = parseTextIntoSections(extractedText.text || (typeof extractedText === 'string' ? extractedText : ''));
       }
     } catch (parseErr) {
-      console.error('Section parsing error:', parseErr.message);
+      console.error('Section parsing error:', parseErr.message, parseErr.stack);
       const fallbackText = extractedText.text || (typeof extractedText === 'string' ? extractedText : '');
       sections = [{ number: '1', title: 'Main Content', content: fallbackText }];
     }
