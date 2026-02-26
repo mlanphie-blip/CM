@@ -114,13 +114,31 @@ router.post('/', authenticate, requireRole('admin', 'editor'), upload.single('fi
 
     const contractId = result.lastInsertRowid;
 
-    // Parse and insert sections — prefer HTML-based parsing for DOCX, fall back to text
+    // Parse and insert sections — chain of parsers from most to least accurate:
+    // 1. DOCX XML parser (reads numbering.xml for exact Word numbering)
+    // 2. HTML parser (mammoth HTML → sections from <ol>/<li> structure)
+    // 3. Text parser (regex pattern matching on raw text)
     let sections;
     try {
       if (manualSections.length > 0) {
         sections = manualSections;
-      } else if (extractedText.html) {
-        sections = parseSectionsFromHtml(extractedText.html) || parseTextIntoSections(extractedText.text);
+      } else if (extractedText.type === 'docx') {
+        // Try direct DOCX XML parsing first (most accurate numbering)
+        sections = await parseSectionsFromDocxXml(filePath);
+        // Fall back to HTML-based parsing
+        if (!sections && extractedText.html) {
+          sections = parseSectionsFromHtml(extractedText.html);
+        }
+        // Fall back to text-based parsing
+        if (!sections) {
+          sections = parseTextIntoSections(extractedText.text);
+        }
+        // Debug: save parsed sections for diagnostics
+        try {
+          const debugDir = path.join(__dirname, '..', '..', 'data');
+          if (!fs.existsSync(debugDir)) fs.mkdirSync(debugDir, { recursive: true });
+          fs.writeFileSync(path.join(debugDir, 'debug_parsed_sections.json'), JSON.stringify(sections, null, 2));
+        } catch (debugErr) { /* ignore */ }
       } else {
         sections = parseTextIntoSections(extractedText.text || (typeof extractedText === 'string' ? extractedText : ''));
       }
@@ -348,7 +366,311 @@ async function extractTextFromFile(filePath, fileType) {
 
 // ---- Section Parsing Engine ----
 
-// For DOCX: parse the HTML output from mammoth to detect section boundaries.
+// Primary parser for DOCX: reads the DOCX ZIP directly to compute the exact
+// numbering that Word displays. This parses word/numbering.xml for numbering
+// definitions (format, start values, level text like "%1.%2.%3.") and
+// word/document.xml for each paragraph's numId and ilvl, then walks through
+// paragraphs in order maintaining counters per level to produce the exact
+// same numbers the user sees in Word.
+async function parseSectionsFromDocxXml(filePath) {
+  let JSZip, DOMParser;
+  try {
+    JSZip = require('jszip');
+    DOMParser = require('@xmldom/xmldom').DOMParser;
+  } catch (err) {
+    console.error('parseSectionsFromDocxXml: missing dependency:', err.message);
+    return null;
+  }
+
+  let zip;
+  try {
+    const data = fs.readFileSync(filePath);
+    zip = await JSZip.loadAsync(data);
+  } catch (err) {
+    console.error('parseSectionsFromDocxXml: failed to read DOCX ZIP:', err.message);
+    return null;
+  }
+
+  const parser = new DOMParser();
+
+  // ---- 1. Parse numbering.xml ----
+  const numXmlStr = await zip.file('word/numbering.xml')?.async('string');
+  if (!numXmlStr) return null; // No numbering info — fall back to HTML parser
+
+  const numDoc = parser.parseFromString(numXmlStr, 'text/xml');
+
+  // Build abstract numbering definitions
+  const abstractDefs = {};
+  const abstractNums = numDoc.getElementsByTagName('w:abstractNum');
+  for (let i = 0; i < abstractNums.length; i++) {
+    const an = abstractNums[i];
+    const id = an.getAttribute('w:abstractNumId');
+    const levels = {};
+    // Only get direct child w:lvl elements (not from nested nsid etc.)
+    for (let c = an.firstChild; c; c = c.nextSibling) {
+      if (c.nodeName !== 'w:lvl') continue;
+      const ilvl = parseInt(c.getAttribute('w:ilvl'), 10);
+      const startEl = getDirectChild(c, 'w:start');
+      const fmtEl = getDirectChild(c, 'w:numFmt');
+      const txtEl = getDirectChild(c, 'w:lvlText');
+      levels[ilvl] = {
+        start: parseInt(startEl?.getAttribute('w:val') || '1', 10),
+        numFmt: fmtEl?.getAttribute('w:val') || 'decimal',
+        lvlText: txtEl?.getAttribute('w:val') || ''
+      };
+    }
+    abstractDefs[id] = { levels };
+  }
+
+  // Build num → abstractNum mapping with overrides
+  const numDefs = {};
+  const nums = numDoc.getElementsByTagName('w:num');
+  for (let i = 0; i < nums.length; i++) {
+    const num = nums[i];
+    const numId = num.getAttribute('w:numId');
+    const abstractRefEl = getDirectChild(num, 'w:abstractNumId');
+    const abstractRef = abstractRefEl?.getAttribute('w:val');
+    if (!abstractRef || !abstractDefs[abstractRef]) continue;
+
+    // Clone levels from abstract definition
+    const levels = {};
+    for (const [lvl, def] of Object.entries(abstractDefs[abstractRef].levels)) {
+      levels[lvl] = { ...def };
+    }
+
+    // Apply level overrides
+    for (let c = num.firstChild; c; c = c.nextSibling) {
+      if (c.nodeName !== 'w:lvlOverride') continue;
+      const ilvl = parseInt(c.getAttribute('w:ilvl'), 10);
+      const startOvr = getDirectChild(c, 'w:startOverride');
+      if (startOvr && levels[ilvl]) {
+        levels[ilvl].start = parseInt(startOvr.getAttribute('w:val'), 10);
+      }
+    }
+
+    numDefs[numId] = { levels };
+  }
+
+  // ---- 2. Parse styles.xml for style-based numbering ----
+  const styleNumMap = {}; // styleName -> { numId, ilvl }
+  const stylesXmlStr = await zip.file('word/styles.xml')?.async('string');
+  if (stylesXmlStr) {
+    const stylesDoc = parser.parseFromString(stylesXmlStr, 'text/xml');
+    const styles = stylesDoc.getElementsByTagName('w:style');
+    for (let i = 0; i < styles.length; i++) {
+      const style = styles[i];
+      const styleId = style.getAttribute('w:styleId');
+      const pPr = getDirectChild(style, 'w:pPr');
+      if (!pPr) continue;
+      const numPr = getDirectChild(pPr, 'w:numPr');
+      if (!numPr) continue;
+      const numIdEl = getDirectChild(numPr, 'w:numId');
+      const ilvlEl = getDirectChild(numPr, 'w:ilvl');
+      if (numIdEl) {
+        styleNumMap[styleId] = {
+          numId: numIdEl.getAttribute('w:val'),
+          ilvl: parseInt(ilvlEl?.getAttribute('w:val') || '0', 10)
+        };
+      }
+    }
+  }
+
+  // ---- 3. Parse document.xml ----
+  const docXmlStr = await zip.file('word/document.xml')?.async('string');
+  if (!docXmlStr) return null;
+
+  const docDoc = parser.parseFromString(docXmlStr, 'text/xml');
+  const pElements = docDoc.getElementsByTagName('w:p');
+
+  // Extract paragraph data
+  const paragraphs = [];
+  for (let i = 0; i < pElements.length; i++) {
+    const p = pElements[i];
+
+    // Get text content from all runs
+    let text = '';
+    const runs = p.getElementsByTagName('w:t');
+    for (let j = 0; j < runs.length; j++) {
+      text += runs[j].textContent || '';
+    }
+    text = text.trim();
+
+    // Check for bold formatting
+    let isBold = false;
+    const rElements = p.getElementsByTagName('w:r');
+    if (rElements.length > 0) {
+      let allRunsBold = true;
+      for (let j = 0; j < rElements.length; j++) {
+        const rPr = getDirectChild(rElements[j], 'w:rPr');
+        if (!rPr || !getDirectChild(rPr, 'w:b')) {
+          // Check if the run has text (skip empty runs)
+          let runText = '';
+          const ts = rElements[j].getElementsByTagName('w:t');
+          for (let k = 0; k < ts.length; k++) runText += ts[k].textContent || '';
+          if (runText.trim()) { allRunsBold = false; break; }
+        }
+      }
+      isBold = allRunsBold && rElements.length > 0;
+    }
+
+    // Get numbering reference (explicit or from style)
+    let numId = null, ilvl = null;
+    const pPr = getDirectChild(p, 'w:pPr');
+    if (pPr) {
+      const numPr = getDirectChild(pPr, 'w:numPr');
+      if (numPr) {
+        const numIdEl = getDirectChild(numPr, 'w:numId');
+        const ilvlEl = getDirectChild(numPr, 'w:ilvl');
+        if (numIdEl) {
+          numId = numIdEl.getAttribute('w:val');
+          ilvl = parseInt(ilvlEl?.getAttribute('w:val') || '0', 10);
+        }
+      }
+      // If no explicit numPr, check if the paragraph style implies numbering
+      if (!numId) {
+        const pStyleEl = getDirectChild(pPr, 'w:pStyle');
+        if (pStyleEl) {
+          const styleId = pStyleEl.getAttribute('w:val');
+          if (styleNumMap[styleId]) {
+            numId = styleNumMap[styleId].numId;
+            ilvl = styleNumMap[styleId].ilvl;
+          }
+        }
+      }
+    }
+
+    // Skip numId="0" which means "no numbering"
+    if (numId === '0') { numId = null; ilvl = null; }
+
+    paragraphs.push({ text, isBold, numId, ilvl });
+  }
+
+  // ---- 4. Compute actual numbers ----
+  const counters = {}; // { numId: { level: currentCount } }
+  const sections = [];
+
+  function formatNumber(val, fmt) {
+    switch (fmt) {
+      case 'upperRoman': return toRoman(val);
+      case 'lowerRoman': return toRoman(val).toLowerCase();
+      case 'upperLetter': return val > 0 && val <= 26 ? String.fromCharCode(64 + val) : String(val);
+      case 'lowerLetter': return val > 0 && val <= 26 ? String.fromCharCode(96 + val) : String(val);
+      case 'decimal': default: return String(val);
+    }
+  }
+
+  function toRoman(num) {
+    const vals = [1000, 900, 500, 400, 100, 90, 50, 40, 10, 9, 5, 4, 1];
+    const syms = ['M', 'CM', 'D', 'CD', 'C', 'XC', 'L', 'XL', 'X', 'IX', 'V', 'IV', 'I'];
+    let result = '';
+    for (let i = 0; i < vals.length; i++) {
+      while (num >= vals[i]) { result += syms[i]; num -= vals[i]; }
+    }
+    return result;
+  }
+
+  function computeNumberText(numId, level) {
+    const def = numDefs[numId];
+    if (!def) return '';
+    const lvlDef = def.levels[level];
+    if (!lvlDef || lvlDef.numFmt === 'bullet') return '';
+
+    let text = lvlDef.lvlText;
+    // Replace %1, %2, %3, etc. with actual counter values
+    for (let l = 0; l <= level; l++) {
+      const val = counters[numId]?.[l] || 0;
+      const fmt = def.levels[l]?.numFmt || 'decimal';
+      text = text.replace('%' + (l + 1), formatNumber(val, fmt));
+    }
+    // Strip trailing dots/periods for cleaner display
+    return text.replace(/\.+$/, '');
+  }
+
+  function makeShortTitle(text) {
+    if (!text) return '';
+    const firstLine = text.split('\n')[0].trim();
+    return firstLine.length <= 80 ? firstLine : firstLine.substring(0, 77) + '...';
+  }
+
+  for (const para of paragraphs) {
+    if (!para.text) continue;
+
+    if (para.numId && numDefs[para.numId]) {
+      const def = numDefs[para.numId];
+      const level = para.ilvl;
+      const isBulletLevel = def.levels[level]?.numFmt === 'bullet';
+
+      if (isBulletLevel) {
+        // Bullet items are content, not numbered sections
+        if (sections.length > 0) {
+          const last = sections[sections.length - 1];
+          last.content += (last.content ? '\n' : '') + '- ' + para.text;
+        }
+        continue;
+      }
+
+      // Initialize counters for this numId if needed
+      if (!counters[para.numId]) {
+        counters[para.numId] = {};
+        for (const [lvl, lvlDef] of Object.entries(def.levels)) {
+          counters[para.numId][lvl] = lvlDef.start - 1;
+        }
+      }
+
+      const ctr = counters[para.numId];
+
+      // Increment counter at this level
+      if (ctr[level] === undefined) ctr[level] = (def.levels[level]?.start || 1) - 1;
+      ctr[level]++;
+
+      // Reset all deeper level counters
+      for (const lvl of Object.keys(ctr)) {
+        if (parseInt(lvl, 10) > level) {
+          ctr[lvl] = (def.levels[lvl]?.start || 1) - 1;
+        }
+      }
+
+      const numberText = computeNumberText(para.numId, level);
+
+      sections.push({
+        number: numberText || String(sections.length + 1),
+        title: (para.isBold && level === 0) ? para.text : makeShortTitle(para.text),
+        content: (para.isBold && level === 0) ? '' : para.text
+      });
+    } else {
+      // Non-numbered paragraph
+      if (para.isBold && para.text.length <= 200) {
+        // Bold heading (document title, exhibit name, etc.)
+        const parsed = parseNumberFromTitle(para.text);
+        sections.push({
+          number: parsed.number || String(sections.length + 1),
+          title: parsed.title,
+          content: ''
+        });
+      } else if (sections.length > 0) {
+        // Append to most recent section's content
+        const last = sections[sections.length - 1];
+        last.content += (last.content ? '\n' : '') + para.text;
+      } else {
+        // Preamble
+        sections.push({ number: '0', title: 'Preamble', content: para.text });
+      }
+    }
+  }
+
+  if (sections.length <= 1) return null;
+  return sections;
+}
+
+// Helper: get a direct child element by name (not searching all descendants)
+function getDirectChild(parent, tagName) {
+  for (let c = parent.firstChild; c; c = c.nextSibling) {
+    if (c.nodeName === tagName) return c;
+  }
+  return null;
+}
+
+// Fallback HTML parser for DOCX: parse the HTML output from mammoth to detect section boundaries.
 // Mammoth converts Word documents to HTML where:
 //   - Heading styles → <h1>-<h6>
 //   - Bold paragraphs → <p><strong>...</strong></p>
