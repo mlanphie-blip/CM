@@ -308,13 +308,14 @@ router.delete('/:id', authenticate, requireRole('admin'), (req, res) => {
 
 // Helper: extract text from uploaded files
 // For DOCX we extract structured HTML to preserve headings, then fall back to raw text for PDF/TXT
+// For DOC (old binary format) we use word-extractor since mammoth only supports DOCX
 async function extractTextFromFile(filePath, fileType) {
   if (fileType === 'pdf') {
     const pdfParse = require('pdf-parse');
     const buffer = fs.readFileSync(filePath);
     const data = await pdfParse(buffer);
     return { text: data.text, html: null, type: 'pdf' };
-  } else if (fileType === 'docx' || fileType === 'doc') {
+  } else if (fileType === 'docx') {
     const mammoth = require('mammoth');
     // Get both HTML (preserves heading styles) and raw text
     const [htmlResult, textResult] = await Promise.all([
@@ -322,6 +323,12 @@ async function extractTextFromFile(filePath, fileType) {
       mammoth.extractRawText({ path: filePath })
     ]);
     return { text: textResult.value, html: htmlResult.value, type: 'docx' };
+  } else if (fileType === 'doc') {
+    // Old binary .doc format — mammoth doesn't support it, use word-extractor
+    const WordExtractor = require('word-extractor');
+    const extractor = new WordExtractor();
+    const doc = await extractor.extract(filePath);
+    return { text: doc.getBody(), html: null, type: 'doc' };
   } else if (fileType === 'txt') {
     return { text: fs.readFileSync(filePath, 'utf-8'), html: null, type: 'txt' };
   }
