@@ -1,0 +1,30 @@
+{
+  "name": "contract-amendment-manager",
+  "version": "1.0.0",
+  "description": "Contract Amendment Management Application",
+  "private": true,
+  "scripts": {
+    "server": "node server/index.js",
+    "client": "cd client && npx react-scripts start",
+    "install:all": "npm install && cd client && npm install",
+    "dev": "concurrently \"npm run server\" \"npm run client\"",
+    "build": "cd client && npx react-scripts build",
+    "start": "NODE_ENV=production node server/index.js",
+    "db:init": "node server/db-init.js"
+  },
+  "dependencies": {
+    "bcryptjs": "^2.4.3",
+    "better-sqlite3": "^11.7.0",
+    "concurrently": "^9.1.0",
+    "cors": "^2.8.5",
+    "diff": "^7.0.0",
+    "docx": "^9.1.0",
+    "express": "^4.21.0",
+    "express-session": "^1.18.1",
+    "jsonwebtoken": "^9.0.2",
+    "mammoth": "^1.8.0",
+    "multer": "^1.4.5-lts.1",
+    "pdf-parse": "^1.1.1",
+    "uuid": "^10.0.0"
+  }
+}
