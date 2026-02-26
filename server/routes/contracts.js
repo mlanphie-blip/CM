@@ -76,73 +76,84 @@ router.get('/:id', authenticate, (req, res) => {
 
 // Create contract with file upload
 router.post('/', authenticate, requireRole('admin', 'editor'), upload.single('file'), async (req, res) => {
-  const { title, description } = req.body;
-  if (!title) return res.status(400).json({ error: 'Title is required' });
+  try {
+    const { title, description } = req.body;
+    if (!title) return res.status(400).json({ error: 'Title is required' });
 
-  const db = getDb();
-  let filePath = null;
-  let fileType = null;
-  let originalFilename = null;
-  let extractedText = '';
+    const db = getDb();
+    let filePath = null;
+    let fileType = null;
+    let originalFilename = null;
+    let extractedText = '';
 
-  if (req.file) {
-    filePath = req.file.filename;
-    fileType = path.extname(req.file.originalname).toLowerCase().slice(1);
-    originalFilename = req.file.originalname;
+    if (req.file) {
+      filePath = req.file.filename;
+      fileType = path.extname(req.file.originalname).toLowerCase().slice(1);
+      originalFilename = req.file.originalname;
 
-    try {
-      extractedText = await extractTextFromFile(req.file.path, fileType);
-    } catch (err) {
-      console.error('Text extraction error:', err.message);
-      extractedText = { text: '', html: null, type: fileType };
+      try {
+        extractedText = await extractTextFromFile(req.file.path, fileType);
+      } catch (err) {
+        console.error('Text extraction error:', err.message);
+        extractedText = { text: '', html: null, type: fileType };
+      }
     }
-  }
 
-  // Allow manual sections via JSON body
-  let manualSections = [];
-  if (req.body.sections) {
+    // Allow manual sections via JSON body
+    let manualSections = [];
+    if (req.body.sections) {
+      try {
+        manualSections = JSON.parse(req.body.sections);
+      } catch (e) { /* ignore parse errors */ }
+    }
+
+    const result = db.prepare(`
+      INSERT INTO contracts (title, description, original_filename, file_path, file_type, created_by)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `).run(title, description || '', originalFilename, filePath, fileType, req.user.id);
+
+    const contractId = result.lastInsertRowid;
+
+    // Parse and insert sections — prefer HTML-based parsing for DOCX, fall back to text
+    let sections;
     try {
-      manualSections = JSON.parse(req.body.sections);
-    } catch (e) { /* ignore parse errors */ }
+      if (manualSections.length > 0) {
+        sections = manualSections;
+      } else if (extractedText.html) {
+        sections = parseSectionsFromHtml(extractedText.html) || parseTextIntoSections(extractedText.text);
+      } else {
+        sections = parseTextIntoSections(extractedText.text || (typeof extractedText === 'string' ? extractedText : ''));
+      }
+    } catch (parseErr) {
+      console.error('Section parsing error:', parseErr.message);
+      const fallbackText = extractedText.text || (typeof extractedText === 'string' ? extractedText : '');
+      sections = [{ number: '1', title: 'Main Content', content: fallbackText }];
+    }
+
+    const insertSection = db.prepare(`
+      INSERT INTO contract_sections (contract_id, section_number, title, content, sort_order)
+      VALUES (?, ?, ?, ?, ?)
+    `);
+
+    for (let i = 0; i < sections.length; i++) {
+      insertSection.run(contractId, sections[i].number || String(i + 1), sections[i].title || '', sections[i].content, i);
+    }
+
+    // Create initial version
+    const fullText = sections.map((s, i) => `${s.number || i + 1}. ${s.title || ''}\n${s.content}`).join('\n\n');
+    db.prepare(`
+      INSERT INTO contract_versions (contract_id, version_number, version_label, change_summary, full_text, sections_snapshot, created_by)
+      VALUES (?, 1, 'Original', 'Initial version', ?, ?, ?)
+    `).run(contractId, fullText, JSON.stringify(sections), req.user.id);
+
+    logAction(req.user.id, 'create_contract', 'contract', contractId, { title });
+    notifyStakeholders(req.user.id, 'contract_created', 'New Contract', `Contract "${title}" has been created`, 'contract', contractId);
+
+    res.status(201).json({ id: contractId, title });
+  } catch (err) {
+    console.error('Contract creation error:', err);
+    res.status(500).json({ error: 'Failed to create contract: ' + err.message });
   }
-
-  const result = db.prepare(`
-    INSERT INTO contracts (title, description, original_filename, file_path, file_type, created_by)
-    VALUES (?, ?, ?, ?, ?, ?)
-  `).run(title, description || '', originalFilename, filePath, fileType, req.user.id);
-
-  const contractId = result.lastInsertRowid;
-
-  // Parse and insert sections — prefer HTML-based parsing for DOCX, fall back to text
-  let sections;
-  if (manualSections.length > 0) {
-    sections = manualSections;
-  } else if (extractedText.html) {
-    sections = parseSectionsFromHtml(extractedText.html) || parseTextIntoSections(extractedText.text);
-  } else {
-    sections = parseTextIntoSections(extractedText.text || (typeof extractedText === 'string' ? extractedText : ''));
-  }
-
-  const insertSection = db.prepare(`
-    INSERT INTO contract_sections (contract_id, section_number, title, content, sort_order)
-    VALUES (?, ?, ?, ?, ?)
-  `);
-
-  for (let i = 0; i < sections.length; i++) {
-    insertSection.run(contractId, sections[i].number || String(i + 1), sections[i].title || '', sections[i].content, i);
-  }
-
-  // Create initial version
-  const fullText = sections.map((s, i) => `${s.number || i + 1}. ${s.title || ''}\n${s.content}`).join('\n\n');
-  db.prepare(`
-    INSERT INTO contract_versions (contract_id, version_number, version_label, change_summary, full_text, sections_snapshot, created_by)
-    VALUES (?, 1, 'Original', 'Initial version', ?, ?, ?)
-  `).run(contractId, fullText, JSON.stringify(sections), req.user.id);
-
-  logAction(req.user.id, 'create_contract', 'contract', contractId, { title });
-  notifyStakeholders(req.user.id, 'contract_created', 'New Contract', `Contract "${title}" has been created`, 'contract', contractId);
-
-  res.status(201).json({ id: contractId, title });
 });
 
 // Update contract sections

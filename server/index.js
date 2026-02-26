@@ -30,6 +30,18 @@ app.use('/api/approvals', approvalRoutes);
 app.use('/api/notifications', notificationRoutes);
 app.use('/api/export', exportRoutes);
 
+// Global error handler — catches multer errors, unhandled async rejections, etc.
+app.use((err, req, res, next) => {
+  console.error('Unhandled error:', err.message || err);
+  if (err.code === 'LIMIT_FILE_SIZE') {
+    return res.status(413).json({ error: 'File too large. Maximum size is 50MB.' });
+  }
+  if (err.message && err.message.includes('Only PDF')) {
+    return res.status(400).json({ error: err.message });
+  }
+  res.status(500).json({ error: err.message || 'Internal server error' });
+});
+
 // Serve static files in production
 if (process.env.NODE_ENV === 'production') {
   app.use(express.static(path.join(__dirname, '..', 'client', 'build')));
