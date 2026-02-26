@@ -353,8 +353,8 @@ async function extractTextFromFile(filePath, fileType) {
 //   - Heading styles → <h1>-<h6>
 //   - Bold paragraphs → <p><strong>...</strong></p>
 //   - Multi-level numbered lists → nested <ol><li> (e.g. 1., 1.1., 1.2.1.)
-// Each numbered clause becomes its own section so users can propose amendments
-// to individual clauses rather than entire top-level groupings.
+// Every numbered clause at every nesting depth becomes its own section so users
+// can propose amendments to individual clauses.
 function parseSectionsFromHtml(html) {
   let parse;
   try {
@@ -367,6 +367,9 @@ function parseSectionsFromHtml(html) {
   const root = parse(html);
   const sections = [];
   let pendingSection = null;
+
+  // Persists across multiple top-level <ol> blocks so numbering never resets
+  let topLevelCounter = 0;
 
   function pushSection(section) {
     sections.push(section);
@@ -382,75 +385,6 @@ function parseSectionsFromHtml(html) {
     }
   }
 
-  // Convert a DOM node to readable plain text, preserving sub-clause numbering.
-  function nodeToText(node, numberPrefix) {
-    if (node.nodeType === 3) return node.rawText; // text node
-    const tag = (node.tagName || '').toLowerCase();
-
-    if (tag === 'ol') {
-      let text = '';
-      let idx = 0;
-      for (const child of node.childNodes) {
-        if ((child.tagName || '').toLowerCase() === 'li') {
-          idx++;
-          const num = numberPrefix ? `${numberPrefix}.${idx}` : `${idx}`;
-          const liText = nodeToText(child, num);
-          text += `\n${num}. ${liText.trim()}`;
-        }
-      }
-      return text;
-    }
-
-    if (tag === 'ul') {
-      let text = '';
-      for (const child of node.childNodes) {
-        if ((child.tagName || '').toLowerCase() === 'li') {
-          text += `\n- ${nodeToText(child, numberPrefix).trim()}`;
-        }
-      }
-      return text;
-    }
-
-    let text = '';
-    for (const child of node.childNodes) {
-      text += nodeToText(child, numberPrefix);
-    }
-    if (tag === 'p' || tag === 'br') text += '\n';
-    return text;
-  }
-
-  // Get the first <strong>/<b> text from a <li>
-  function getLiBoldTitle(li) {
-    for (const child of li.childNodes) {
-      const childTag = (child.tagName || '').toLowerCase();
-      if (childTag === 'strong' || childTag === 'b') {
-        return child.textContent.trim().replace(/[.\s:]+$/, '');
-      }
-    }
-    return '';
-  }
-
-  // Get inline text from <li>, excluding bold titles and nested lists
-  function getLiInlineText(li) {
-    const parts = [];
-    for (const child of li.childNodes) {
-      const childTag = (child.tagName || '').toLowerCase();
-      if (childTag === 'ol' || childTag === 'ul' || childTag === 'strong' || childTag === 'b') continue;
-      const t = (child.nodeType === 3) ? child.rawText : child.textContent;
-      if (t.trim()) parts.push(t.trim());
-    }
-    return parts.join(' ');
-  }
-
-  // Find first nested <ol> or <ul> in a <li>
-  function getNestedList(li) {
-    for (const child of li.childNodes) {
-      const childTag = (child.tagName || '').toLowerCase();
-      if (childTag === 'ol' || childTag === 'ul') return child;
-    }
-    return null;
-  }
-
   // Generate a short title from clause text (first line, max 80 chars)
   function makeTitle(text) {
     if (!text) return '';
@@ -459,65 +393,108 @@ function parseSectionsFromHtml(html) {
     return firstLine.substring(0, 77) + '...';
   }
 
-  // Process a clause <li> — creates its own section.
-  // Any deeper nested lists are rendered as content text within this section.
-  function processClause(li, sectionNumber) {
-    const boldTitle = getLiBoldTitle(li);
-    const inlineText = getLiInlineText(li);
-    const nestedList = getNestedList(li);
+  // Render a <ul> node as bullet-point text (not sections)
+  function ulToText(ul) {
+    let text = '';
+    for (const child of ul.childNodes) {
+      if ((child.tagName || '').toLowerCase() === 'li') {
+        text += '\n- ' + liDirectText(child).trim();
+      }
+    }
+    return text;
+  }
 
-    const contentParts = [];
-    if (inlineText) contentParts.push(inlineText);
-    if (nestedList) {
-      contentParts.push(nodeToText(nestedList, sectionNumber).trim());
+  // Get ALL direct text from a <li>, excluding nested <ol>/<ul> elements.
+  // Bold text IS included (it's content emphasis, not always a heading).
+  function liDirectText(li) {
+    let text = '';
+    for (const child of li.childNodes) {
+      const tag = (child.tagName || '').toLowerCase();
+      if (tag === 'ol' || tag === 'ul') continue;
+      text += child.textContent || child.rawText || '';
+    }
+    return text.trim();
+  }
+
+  // Get the bold title from a <li>, but ONLY when:
+  //   1. The first non-whitespace child is <strong>/<b>
+  //   2. The <li> also has a nested <ol> (so it's a parent heading, not a leaf)
+  // This avoids treating inline bold emphasis as section headings.
+  function getLiBoldTitle(li, hasNestedOl) {
+    if (!hasNestedOl) return '';
+    for (const child of li.childNodes) {
+      if (child.nodeType === 3 && !child.rawText.trim()) continue;
+      const tag = (child.tagName || '').toLowerCase();
+      if (tag === 'strong' || tag === 'b') {
+        return child.textContent.trim().replace(/[.\s:]+$/, '');
+      }
+      break; // first non-whitespace child is not bold
+    }
+    return '';
+  }
+
+  // Recursively process a <li> element at any nesting depth.
+  // Creates a section for this <li>, then recurses into any nested <ol>.
+  function processLi(li, sectionNumber) {
+    const directText = liDirectText(li);
+
+    // Find all nested <ol> and <ul> children
+    const nestedOls = [];
+    const nestedUls = [];
+    for (const child of li.childNodes) {
+      const tag = (child.tagName || '').toLowerCase();
+      if (tag === 'ol') nestedOls.push(child);
+      else if (tag === 'ul') nestedUls.push(child);
     }
 
-    const content = contentParts.join('\n');
-    const title = boldTitle || makeTitle(inlineText || content);
+    const hasNestedOl = nestedOls.length > 0;
+    const boldTitle = getLiBoldTitle(li, hasNestedOl);
+
+    // Determine title and content
+    let title, content;
+    if (boldTitle) {
+      title = boldTitle;
+      // Content is everything except the bold title text
+      const remaining = directText.replace(boldTitle, '').replace(/^[.\s:]+/, '').trim();
+      content = remaining;
+    } else {
+      title = makeTitle(directText);
+      content = directText;
+    }
+
+    // Append <ul> content as bullet text (bullets aren't numbered sections)
+    for (const ul of nestedUls) {
+      const ulText = ulToText(ul).trim();
+      if (ulText) {
+        content = content ? content + '\n' + ulText : ulText;
+      }
+    }
 
     pushSection({
       number: sectionNumber,
-      title: title,
+      title: title || '(untitled)',
       content: content
     });
+
+    // Recursively process ALL nested <ol> elements.
+    // A single counter spans all <ol>s within this <li> so numbering is continuous.
+    let childIdx = 0;
+    for (const ol of nestedOls) {
+      for (const childLi of ol.childNodes) {
+        if ((childLi.tagName || '').toLowerCase() !== 'li') continue;
+        childIdx++;
+        processLi(childLi, `${sectionNumber}.${childIdx}`);
+      }
+    }
   }
 
-  // Process a top-level <ol> — each <li> becomes one or more sections.
-  // If a <li> has a bold title AND a nested <ol>, the title becomes a heading
-  // section and each nested <li> becomes its own clause section.
+  // Process a top-level <ol> block. Uses topLevelCounter which persists across
+  // multiple <ol> blocks so section 4 doesn't get numbered as 1.
   function processTopLevelOl(ol) {
-    let topIdx = 0;
     for (const li of ol.childNodes) {
       if ((li.tagName || '').toLowerCase() !== 'li') continue;
-      topIdx++;
-
-      const boldTitle = getLiBoldTitle(li);
-      const nestedList = getNestedList(li);
-
-      if (boldTitle && nestedList && (nestedList.tagName || '').toLowerCase() === 'ol') {
-        // Major section: bold heading with numbered sub-items.
-        // Create a heading section, then individual sections for each sub-item.
-        const parsed = parseNumberFromTitle(boldTitle);
-        const sectionNum = parsed.number || String(topIdx);
-        const inlineText = getLiInlineText(li);
-
-        pushSection({
-          number: sectionNum,
-          title: parsed.title || boldTitle,
-          content: inlineText || ''
-        });
-
-        // Each sub-item becomes its own section
-        let subIdx = 0;
-        for (const subLi of nestedList.childNodes) {
-          if ((subLi.tagName || '').toLowerCase() !== 'li') continue;
-          subIdx++;
-          processClause(subLi, `${topIdx}.${subIdx}`);
-        }
-      } else {
-        // Simple clause without sub-structure — single section
-        processClause(li, String(topIdx));
-      }
+      topLevelCounter++;
+      processLi(li, String(topLevelCounter));
     }
   }
 
@@ -562,7 +539,7 @@ function parseSectionsFromHtml(html) {
       continue;
     }
 
-    // --- Ordered list: expand into individual clause sections ---
+    // --- Ordered list: recursively expand into individual clause sections ---
     if (tag === 'ol') {
       processTopLevelOl(node);
       continue;
@@ -575,7 +552,6 @@ function parseSectionsFromHtml(html) {
   }
 
   // Quality check: if we only got 1 section, the HTML parsing wasn't helpful
-  // Return null to fall through to the text-based parser which uses pattern matching
   if (sections.length <= 1) return null;
 
   return sections;
