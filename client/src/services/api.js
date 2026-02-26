@@ -50,6 +50,7 @@ const api = {
   compareVersions: (contractId, v1, v2) => request(`/contracts/${contractId}/compare?v1=${v1}&v2=${v2}`),
   rollback: (contractId, versionId) => request(`/contracts/${contractId}/rollback/${versionId}`, { method: 'POST' }),
   deleteContract: (id) => request(`/contracts/${id}`, { method: 'DELETE' }),
+  reparseContract: (id) => request(`/contracts/${id}/reparse`, { method: 'POST' }),
 
   // Proposals
   getProposals: (params = {}) => {

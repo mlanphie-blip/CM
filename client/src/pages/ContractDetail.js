@@ -49,6 +49,15 @@ export default function ContractDetail() {
     try { await api.deleteContract(id); navigate('/contracts'); } catch (err) { setError(err.message); }
   };
 
+  const handleReparse = async () => {
+    if (!window.confirm('Re-parse this contract from the original file? This will regenerate all sections.')) return;
+    try {
+      const result = await api.reparseContract(id);
+      alert(result.message || 'Re-parsed successfully');
+      loadContract();
+    } catch (err) { setError(err.message); }
+  };
+
   const handleExport = (type) => {
     const token = localStorage.getItem('token');
     let url;
@@ -98,6 +107,7 @@ export default function ContractDetail() {
           {canEdit && !editing && (
             <div className="flex gap-2 mb-3">
               <button className="btn btn-outline btn-sm" onClick={() => setEditing(true)}>Edit Sections</button>
+              {contract.file_path && <button className="btn btn-outline btn-sm" onClick={handleReparse}>Re-parse from File</button>}
             </div>
           )}
           {editing ? (
@@ -127,7 +137,7 @@ export default function ContractDetail() {
               {contract.sections.map(s => (
                 <div key={s.id} className="card mb-3" id={`section-${s.id}`}>
                   <div className="card-header">
-                    <h3>{s.section_number}. {s.title || 'Untitled Section'}</h3>
+                    <h3>{s.section_number}{/\d$/.test(s.section_number) ? '.' : ''} {s.title || 'Untitled Section'}</h3>
                     {canEdit && (
                       <button className="btn btn-primary btn-sm" onClick={() => { setSelectedSection(s); setShowProposalForm(true); }}>
                         Propose Change
