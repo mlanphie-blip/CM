@@ -337,112 +337,167 @@ async function extractTextFromFile(filePath, fileType) {
 
 // ---- Section Parsing Engine ----
 
-// For DOCX: parse the HTML output to detect headings (h1-h6, <strong>/<b> blocks)
-// and numbered list items (<ol><li>) as section boundaries.
-// Mammoth converts Word numbered lists to <ol><li> elements — each <li> is a contract clause.
+// For DOCX: parse the HTML output from mammoth to detect section boundaries.
+// Mammoth converts Word documents to HTML where:
+//   - Heading styles → <h1>-<h6>
+//   - Bold paragraphs → <p><strong>...</strong></p>
+//   - Multi-level numbered lists → nested <ol><li> (e.g. 1., 1.1., 1.2.1.)
+// For contracts, only top-level list items are sections; nested items are sub-clause content.
 function parseSectionsFromHtml(html) {
+  const { parse } = require('node-html-parser');
+  const root = parse(html);
   const sections = [];
   let sectionCounter = 0;
+  let pendingSection = null;
 
-  // Pre-process: extract <li> items from ordered lists into individual tokens.
-  // Mammoth outputs: <ol><li>clause 1</li><li>clause 2</li></ol>
-  // We need each <li> to be treated as a separate section.
-  // Replace <ol>...</ol> blocks by extracting each <li> as a standalone marker.
-  const preprocessed = html.replace(/<ol[^>]*>([\s\S]*?)<\/ol>/gi, (match, inner) => {
-    // Split out each <li>...</li> and wrap as a recognizable token
-    return inner.replace(/<li[^>]*>([\s\S]*?)<\/li>/gi, (liMatch, liContent) => {
-      return `<!--LI_SECTION-->${liContent}<!--/LI_SECTION-->`;
-    });
-  });
+  function appendContent(text) {
+    if (!text.trim()) return;
+    if (pendingSection) {
+      pendingSection.content += (pendingSection.content ? '\n' : '') + text.trim();
+    } else {
+      sectionCounter++;
+      pendingSection = { number: '0', title: 'Preamble', content: text.trim() };
+      sections.push(pendingSection);
+    }
+  }
 
-  // Split on heading tags, bold-only paragraphs, and our LI_SECTION markers
-  const parts = preprocessed.split(
-    /(<h[1-6][^>]*>[\s\S]*?<\/h[1-6]>|<p>\s*(?:<(?:strong|b)[^>]*>[\s\S]{1,300}?<\/(?:strong|b)>\s*)+<\/p>|<!--LI_SECTION-->[\s\S]*?<!--\/LI_SECTION-->)/i
-  );
+  // Convert a DOM node (and all its children) to readable plain text,
+  // preserving sub-clause numbering for nested lists.
+  function nodeToText(node, numberPrefix) {
+    if (node.nodeType === 3) return node.rawText; // text node
+    const tag = (node.tagName || '').toLowerCase();
 
-  let pendingHeading = null;
-
-  for (const part of parts) {
-    const trimmed = part.trim();
-    if (!trimmed) continue;
-
-    // Check: is this a heading tag (h1-h6)?
-    const headingMatch = trimmed.match(/<h[1-6][^>]*>([\s\S]*?)<\/h[1-6]>/i);
-
-    // Check: is this a bold-only paragraph?
-    let boldHeadingMatch = null;
-    if (!headingMatch) {
-      const boldParagraph = trimmed.match(/^<p>\s*((?:<(?:strong|b)[^>]*>[\s\S]*?<\/(?:strong|b)>\s*)+)<\/p>$/i);
-      if (boldParagraph) {
-        const innerText = boldParagraph[1].replace(/<[^>]+>/g, '').trim();
-        if (innerText.length > 0 && innerText.length <= 200) {
-          boldHeadingMatch = [trimmed, innerText];
+    if (tag === 'ol') {
+      // Numbered sub-list — render each <li> with its sub-clause number
+      let text = '';
+      let idx = 0;
+      for (const child of node.childNodes) {
+        if ((child.tagName || '').toLowerCase() === 'li') {
+          idx++;
+          const num = numberPrefix ? `${numberPrefix}.${idx}` : `${idx}`;
+          const liText = nodeToText(child, num);
+          text += `\n${num}. ${liText.trim()}`;
         }
       }
+      return text;
     }
 
-    // Check: is this a list item section?
-    const liMatch = trimmed.match(/^<!--LI_SECTION-->([\s\S]*?)<!--\/LI_SECTION-->$/);
+    if (tag === 'ul') {
+      let text = '';
+      for (const child of node.childNodes) {
+        if ((child.tagName || '').toLowerCase() === 'li') {
+          const liText = nodeToText(child, numberPrefix);
+          text += `\n- ${liText.trim()}`;
+        }
+      }
+      return text;
+    }
 
-    if (headingMatch || boldHeadingMatch) {
-      // Heading (h1-h6 or bold paragraph) — start a new section
-      const rawTitle = (headingMatch ? headingMatch[1] : boldHeadingMatch[1])
-        .replace(/<[^>]+>/g, '').trim();
+    // For <li> and other tags: recurse into children
+    let text = '';
+    for (const child of node.childNodes) {
+      text += nodeToText(child, numberPrefix);
+    }
+    if (tag === 'p' || tag === 'br') text += '\n';
+    return text;
+  }
+
+  // Walk the top-level children of the document
+  for (const node of root.childNodes) {
+    const tag = (node.tagName || '').toLowerCase();
+
+    // --- Heading tags (h1-h6): always a section boundary ---
+    if (/^h[1-6]$/.test(tag)) {
+      const rawTitle = node.textContent.trim();
       if (!rawTitle) continue;
-
       const parsed = parseNumberFromTitle(rawTitle);
       sectionCounter++;
-      pendingHeading = {
+      pendingSection = {
         number: parsed.number || String(sectionCounter),
         title: parsed.title,
         content: ''
       };
-      sections.push(pendingHeading);
-    } else if (liMatch) {
-      // Numbered list item — each is a separate clause/section
-      const liHtml = liMatch[1];
-      sectionCounter++;
+      sections.push(pendingSection);
+      continue;
+    }
 
-      // Check if the <li> starts with a bold title: <strong>TITLE.</strong> body text
-      const boldTitleMatch = liHtml.match(/^\s*<(?:strong|b)[^>]*>([\s\S]*?)<\/(?:strong|b)>\s*([\s\S]*)$/i);
-      let title, content;
-      if (boldTitleMatch) {
-        title = boldTitleMatch[1].replace(/<[^>]+>/g, '').trim().replace(/[.\s:]+$/, '');
-        content = stripHtml(boldTitleMatch[2]).trim();
-      } else {
-        // No bold title — use the full text, try to extract a title from the start
-        const fullText = stripHtml(liHtml).trim();
-        // Try to extract a short title before a period or colon
-        const titleSplit = fullText.match(/^([A-Z][^.]{2,80})[.:]?\s+([\s\S]*)$/);
-        if (titleSplit && titleSplit[1].length <= 80) {
-          title = titleSplit[1].replace(/[.\s:]+$/, '');
-          content = titleSplit[2];
-        } else {
-          title = '';
-          content = fullText;
+    // --- Bold-only paragraph: treat as section heading ---
+    if (tag === 'p') {
+      const children = node.childNodes.filter(c => c.nodeType !== 3 || c.rawText.trim());
+      const allBold = children.length > 0 && children.every(c => {
+        const ct = (c.tagName || '').toLowerCase();
+        return ct === 'strong' || ct === 'b' || (c.nodeType === 3 && !c.rawText.trim());
+      });
+      if (allBold) {
+        const innerText = node.textContent.trim();
+        if (innerText.length > 0 && innerText.length <= 200) {
+          const parsed = parseNumberFromTitle(innerText);
+          sectionCounter++;
+          pendingSection = {
+            number: parsed.number || String(sectionCounter),
+            title: parsed.title,
+            content: ''
+          };
+          sections.push(pendingSection);
+          continue;
         }
       }
+      // Regular paragraph — append as content
+      appendContent(node.textContent);
+      continue;
+    }
 
-      const parsed = parseNumberFromTitle(title || content.substring(0, 60));
-      pendingHeading = {
-        number: parsed.number || String(sectionCounter),
-        title: title ? (parsed.title || title) : parsed.title,
-        content: content
-      };
-      sections.push(pendingHeading);
-    } else {
-      // Body content — strip HTML and attach to current section
-      const plainText = stripHtml(trimmed);
-      if (!plainText.trim()) continue;
-
-      if (pendingHeading) {
-        pendingHeading.content += (pendingHeading.content ? '\n' : '') + plainText.trim();
-      } else {
-        // Content before any heading — create Preamble
+    // --- Ordered list: each direct <li> child is a top-level section ---
+    if (tag === 'ol') {
+      let topIdx = 0;
+      for (const li of node.childNodes) {
+        if ((li.tagName || '').toLowerCase() !== 'li') continue;
+        topIdx++;
         sectionCounter++;
-        pendingHeading = { number: '0', title: 'Preamble', content: plainText.trim() };
-        sections.push(pendingHeading);
+
+        // Separate the bold title (if any) from the rest of the <li> content
+        let title = '';
+        let contentParts = [];
+
+        for (const child of li.childNodes) {
+          const childTag = (child.tagName || '').toLowerCase();
+          if ((childTag === 'strong' || childTag === 'b') && !title) {
+            // First bold element is the section title
+            title = child.textContent.trim().replace(/[.\s:]+$/, '');
+          } else if (childTag === 'ol' || childTag === 'ul') {
+            // Nested list — render as numbered sub-clauses
+            let subIdx = 0;
+            for (const subLi of child.childNodes) {
+              if ((subLi.tagName || '').toLowerCase() === 'li') {
+                subIdx++;
+                const subNum = `${topIdx}.${subIdx}`;
+                const subText = nodeToText(subLi, subNum);
+                contentParts.push(`${subNum}. ${subText.trim()}`);
+              }
+            }
+          } else {
+            // Plain text or other inline content
+            const text = (child.nodeType === 3) ? child.rawText : child.textContent;
+            if (text.trim()) contentParts.push(text.trim());
+          }
+        }
+
+        const content = contentParts.join('\n');
+        const parsed = title ? parseNumberFromTitle(title) : { number: '', title: '' };
+
+        pendingSection = {
+          number: parsed.number || String(topIdx),
+          title: parsed.title || title,
+          content: content
+        };
+        sections.push(pendingSection);
       }
+      continue;
+    }
+
+    // --- Anything else: treat as content ---
+    if (node.textContent && node.textContent.trim()) {
+      appendContent(node.textContent);
     }
   }
 
