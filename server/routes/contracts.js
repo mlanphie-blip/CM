@@ -330,12 +330,14 @@ async function extractTextFromFile(filePath, fileType) {
 
 // ---- Section Parsing Engine ----
 
-// For DOCX: parse the HTML output to detect headings (h1-h6, <strong> blocks) as section boundaries
+// For DOCX: parse the HTML output to detect headings (h1-h6, <strong>/<b> blocks) as section boundaries
 function parseSectionsFromHtml(html) {
   const sections = [];
   // Split on heading tags — mammoth converts Word heading styles to h1-h6
-  // Also treat standalone <p><strong>TEXT</strong></p> as a heading (common Word pattern)
-  const parts = html.split(/(<h[1-6][^>]*>[\s\S]*?<\/h[1-6]>|<p>\s*<strong>[^<]{1,200}<\/strong>\s*<\/p>)/i);
+  // Also treat standalone bold paragraphs as headings (common Word pattern):
+  //   <p><strong>TEXT</strong></p>  or  <p><b>TEXT</b></p>
+  //   Handles nested tags inside bold, multiple bold spans in one <p>, and mixed <b>/<strong>
+  const parts = html.split(/(<h[1-6][^>]*>[\s\S]*?<\/h[1-6]>|<p>\s*(?:<(?:strong|b)[^>]*>[\s\S]{1,300}?<\/(?:strong|b)>\s*)+<\/p>)/i);
 
   let pendingHeading = null;
   let sectionCounter = 0;
@@ -346,7 +348,19 @@ function parseSectionsFromHtml(html) {
 
     // Check if this part is a heading
     const headingMatch = trimmed.match(/<h[1-6][^>]*>([\s\S]*?)<\/h[1-6]>/i);
-    const boldHeadingMatch = !headingMatch && trimmed.match(/^<p>\s*<strong>([^<]{1,200})<\/strong>\s*<\/p>$/i);
+    // Bold heading: <p> containing only <strong>/<b> tags (no other text content outside the bold tags)
+    let boldHeadingMatch = null;
+    if (!headingMatch) {
+      const boldParagraph = trimmed.match(/^<p>\s*((?:<(?:strong|b)[^>]*>[\s\S]*?<\/(?:strong|b)>\s*)+)<\/p>$/i);
+      if (boldParagraph) {
+        // Extract the text content from the bold tags
+        const innerText = boldParagraph[1].replace(/<[^>]+>/g, '').trim();
+        // Only treat as heading if it's short enough (not a bold paragraph of body text)
+        if (innerText.length > 0 && innerText.length <= 200) {
+          boldHeadingMatch = [trimmed, innerText];
+        }
+      }
+    }
 
     if (headingMatch || boldHeadingMatch) {
       // This is a heading — start a new section
@@ -378,7 +392,11 @@ function parseSectionsFromHtml(html) {
     }
   }
 
-  return sections.length > 0 ? sections : null; // null = fall through to text parser
+  // Quality check: if we only got 1 section, the HTML parsing wasn't helpful
+  // Return null to fall through to the text-based parser which uses pattern matching
+  if (sections.length <= 1) return null;
+
+  return sections;
 }
 
 function stripHtml(html) {
