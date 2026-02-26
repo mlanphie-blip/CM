@@ -124,14 +124,22 @@ router.post('/', authenticate, requireRole('admin', 'editor'), upload.single('fi
         sections = manualSections;
       } else if (extractedText.type === 'docx') {
         // Try direct DOCX XML parsing first (most accurate numbering)
-        sections = await parseSectionsFromDocxXml(filePath);
+        console.log('[Parser] Trying DOCX XML parser on:', req.file.path);
+        sections = await parseSectionsFromDocxXml(req.file.path);
+        if (sections) {
+          console.log('[Parser] DOCX XML parser succeeded:', sections.length, 'sections');
+        }
         // Fall back to HTML-based parsing
         if (!sections && extractedText.html) {
+          console.log('[Parser] DOCX XML failed, falling back to HTML parser');
           sections = parseSectionsFromHtml(extractedText.html);
+          if (sections) console.log('[Parser] HTML parser produced:', sections.length, 'sections');
         }
         // Fall back to text-based parsing
         if (!sections) {
+          console.log('[Parser] Falling back to text parser');
           sections = parseTextIntoSections(extractedText.text);
+          console.log('[Parser] Text parser produced:', sections.length, 'sections');
         }
         // Debug: save parsed sections for diagnostics
         try {
