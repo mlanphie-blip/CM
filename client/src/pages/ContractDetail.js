@@ -156,20 +156,18 @@ export default function ContractDetail() {
               <div
                 ref={docRef}
                 onMouseUp={handleMouseUp}
+                className="contract-document"
                 style={{
-                  whiteSpace: 'pre-wrap',
                   lineHeight: 1.8,
-                  fontFamily: '"Courier New", Courier, monospace',
-                  fontSize: 13,
+                  fontSize: 14,
                   maxHeight: '70vh',
                   overflow: 'auto',
-                  padding: '8px 0',
+                  padding: '8px 16px',
                   cursor: 'text',
                   userSelect: 'text'
                 }}
-              >
-                {fullText}
-              </div>
+                dangerouslySetInnerHTML={{ __html: fullText }}
+              />
             </div>
           </div>
           {proposals.length > 0 && (

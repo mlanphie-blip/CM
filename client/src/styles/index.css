@@ -253,6 +253,35 @@ tr:hover td { background: var(--gray-50); }
 .priority-high { color: #ea580c; }
 .priority-critical { color: var(--danger); }
 
+/* Contract document rendered HTML */
+.contract-document h1, .contract-document h2, .contract-document h3,
+.contract-document h4, .contract-document h5, .contract-document h6 {
+  margin: 20px 0 8px 0; font-weight: 700; color: var(--gray-800);
+}
+.contract-document h1 { font-size: 20px; }
+.contract-document h2 { font-size: 18px; }
+.contract-document h3 { font-size: 16px; }
+.contract-document h4 { font-size: 15px; }
+.contract-document p { margin: 6px 0; }
+.contract-document ol, .contract-document ul {
+  margin: 4px 0; padding-left: 28px;
+}
+.contract-document ol { list-style-type: decimal; }
+.contract-document ol ol { list-style-type: decimal; }
+.contract-document ol ol ol { list-style-type: lower-alpha; }
+.contract-document ol ol ol ol { list-style-type: lower-roman; }
+.contract-document li { margin: 4px 0; padding-left: 4px; }
+.contract-document strong, .contract-document b { font-weight: 700; }
+.contract-document table {
+  border-collapse: collapse; width: 100%; margin: 12px 0;
+}
+.contract-document table td, .contract-document table th {
+  border: 1px solid var(--gray-300); padding: 6px 10px; font-size: 13px;
+}
+.contract-document ::selection {
+  background: #bfdbfe;
+}
+
 /* Responsive */
 @media (max-width: 768px) {
   .main-content { padding: 16px; }

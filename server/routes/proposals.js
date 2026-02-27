@@ -168,16 +168,51 @@ router.post('/:id/submit', authenticate, (req, res) => {
 });
 
 // Apply approved proposal to contract
+// Performs a targeted find-and-replace: locates the original_text within the
+// section content and replaces only that portion with proposed_text.
 router.post('/:id/apply', authenticate, requireRole('admin', 'editor'), (req, res) => {
   const db = getDb();
   const proposal = db.prepare('SELECT * FROM proposals WHERE id = ?').get(req.params.id);
   if (!proposal) return res.status(404).json({ error: 'Proposal not found' });
   if (proposal.status !== 'approved') return res.status(400).json({ error: 'Only approved proposals can be applied' });
 
-  if (proposal.section_id) {
+  if (proposal.section_id && proposal.original_text && proposal.proposed_text) {
+    const section = db.prepare('SELECT content FROM contract_sections WHERE id = ?').get(proposal.section_id);
+    if (!section) return res.status(404).json({ error: 'Target section not found' });
+
+    // The content may be HTML (from mammoth) while original_text is plain text
+    // (from browser selection).  Try direct replacement first — works when the
+    // selected text appears verbatim inside the HTML.  If that doesn't match,
+    // escape the original text for a regex search that tolerates HTML tags
+    // interspersed between words (e.g. across <p> or <li> boundaries).
+    let updatedContent = section.content;
+    if (updatedContent.includes(proposal.original_text)) {
+      // Direct match: replace only the first occurrence
+      updatedContent = updatedContent.replace(proposal.original_text, proposal.proposed_text);
+    } else {
+      // Build a regex that allows optional HTML tags between each character
+      // of the original text — handles cross-element selections
+      const escaped = proposal.original_text
+        .replace(/[.*+?^${}()|[\]\\]/g, '\\$&')  // escape regex chars
+        .split('')
+        .join('(?:<[^>]*>)*');  // allow HTML tags between any chars
+      const re = new RegExp(escaped);
+      if (re.test(updatedContent)) {
+        updatedContent = updatedContent.replace(re, proposal.proposed_text);
+      } else {
+        // Last resort: replace entire section content
+        console.warn(`[Apply] Could not find original_text in section ${proposal.section_id}, replacing entire section`);
+        updatedContent = proposal.proposed_text;
+      }
+    }
+
+    db.prepare('UPDATE contract_sections SET content = ? WHERE id = ?').run(updatedContent, proposal.section_id);
+  } else if (proposal.section_id) {
+    // No original_text — legacy behavior: replace entire section
     db.prepare('UPDATE contract_sections SET content = ? WHERE id = ?').run(proposal.proposed_text, proposal.section_id);
   }
 
+  db.prepare("UPDATE proposals SET status = 'applied' WHERE id = ?").run(req.params.id);
   logAction(req.user.id, 'apply_proposal', 'proposal', Number(req.params.id));
   res.json({ message: 'Proposal applied to contract' });
 });

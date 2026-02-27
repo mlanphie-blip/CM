@@ -114,25 +114,16 @@ router.post('/', authenticate, requireRole('admin', 'editor'), upload.single('fi
 
     const contractId = result.lastInsertRowid;
 
-    // Parse contract into a single full-text document with Word numbering preserved.
-    // The entire contract is stored as one section so the user can highlight any
-    // text to propose amendments.  Numbering from Word outline lists is computed
-    // from the DOCX XML so it appears exactly as in the original document.
+    // Store the contract as a single section.  For DOCX files we use the
+    // mammoth HTML which preserves headings, bold text, and numbered lists
+    // so the document renders with its original formatting.
     let sections;
     try {
       if (manualSections.length > 0) {
         sections = manualSections;
-      } else if (extractedText.type === 'docx') {
-        console.log('[Parser] Extracting full text with numbering from:', req.file.path);
-        const fullDoc = await extractFullTextWithNumbering(req.file.path);
-        if (fullDoc) {
-          console.log('[Parser] Extracted', fullDoc.length, 'chars with numbering');
-          sections = [{ number: '1', title: 'Full Contract', content: fullDoc }];
-        } else {
-          // Fallback: use mammoth raw text (numbers may be missing for outline lists)
-          console.log('[Parser] DOCX extraction returned null, using mammoth raw text');
-          sections = [{ number: '1', title: 'Full Contract', content: extractedText.text || '' }];
-        }
+      } else if (extractedText.type === 'docx' && extractedText.html) {
+        console.log('[Parser] Using mammoth HTML for formatted display');
+        sections = [{ number: '1', title: 'Full Contract', content: extractedText.html }];
       } else {
         sections = [{ number: '1', title: 'Full Contract', content: extractedText.text || (typeof extractedText === 'string' ? extractedText : '') }];
       }
@@ -1500,20 +1491,21 @@ async function reparseContract(contractId) {
     return { success: false, reason: 'File not found: ' + fullPath };
   }
 
-  let fullText = await extractFullTextWithNumbering(fullPath);
-  if (!fullText) {
-    // Fallback to mammoth raw text
-    try {
-      const mammoth = require('mammoth');
-      const textResult = await mammoth.extractRawText({ path: fullPath });
-      fullText = textResult.value;
-    } catch (err) {
-      console.error('[Reparse] mammoth fallback failed for contract', contractId, err.message);
-      return { success: false, reason: 'Text extraction failed' };
-    }
+  let htmlContent;
+  try {
+    const mammoth = require('mammoth');
+    const htmlResult = await mammoth.convertToHtml({ path: fullPath });
+    htmlContent = htmlResult.value;
+  } catch (err) {
+    console.error('[Reparse] mammoth failed for contract', contractId, err.message);
+    return { success: false, reason: 'HTML extraction failed' };
   }
 
-  const sections = [{ number: '1', title: 'Full Contract', content: fullText }];
+  if (!htmlContent) {
+    return { success: false, reason: 'mammoth returned empty HTML' };
+  }
+
+  const sections = [{ number: '1', title: 'Full Contract', content: htmlContent }];
 
   // Replace sections in the database
   db.prepare('DELETE FROM contract_sections WHERE contract_id = ?').run(contractId);
