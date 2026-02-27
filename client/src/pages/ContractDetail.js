@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { useParams, Link, useNavigate } from 'react-router-dom';
 import { useAuth } from '../contexts/AuthContext';
 import api from '../services/api';
@@ -8,21 +8,20 @@ export default function ContractDetail() {
   const { user } = useAuth();
   const navigate = useNavigate();
   const [contract, setContract] = useState(null);
-  const [activeTab, setActiveTab] = useState('sections');
+  const [activeTab, setActiveTab] = useState('document');
   const [showProposalForm, setShowProposalForm] = useState(false);
-  const [selectedSection, setSelectedSection] = useState(null);
-  const [editing, setEditing] = useState(false);
-  const [editSections, setEditSections] = useState([]);
+  const [selectedText, setSelectedText] = useState('');
   const [proposals, setProposals] = useState([]);
   const [templates, setTemplates] = useState([]);
   const [showVersionForm, setShowVersionForm] = useState(false);
   const [error, setError] = useState('');
+  const [selectionPos, setSelectionPos] = useState(null);
+  const docRef = useRef(null);
 
   const loadContract = useCallback(async () => {
     try {
       const data = await api.getContract(id);
       setContract(data);
-      setEditSections(data.sections.map(s => ({ ...s })));
     } catch (err) { setError(err.message); }
   }, [id]);
 
@@ -36,21 +35,13 @@ export default function ContractDetail() {
     api.getTemplates().then(setTemplates).catch(() => {});
   }, [loadContract, loadProposals]);
 
-  const handleSaveSections = async () => {
-    try {
-      await api.updateSections(id, editSections);
-      setEditing(false);
-      loadContract();
-    } catch (err) { setError(err.message); }
-  };
-
   const handleDelete = async () => {
     if (!window.confirm('Delete this contract and all related data?')) return;
     try { await api.deleteContract(id); navigate('/contracts'); } catch (err) { setError(err.message); }
   };
 
   const handleReparse = async () => {
-    if (!window.confirm('Re-parse this contract from the original file? This will regenerate all sections.')) return;
+    if (!window.confirm('Re-parse this contract from the original file? This will regenerate the document text.')) return;
     try {
       const result = await api.reparseContract(id);
       alert(result.message || 'Re-parsed successfully');
@@ -68,10 +59,41 @@ export default function ContractDetail() {
     window.open(url + (url.includes('?') ? '&' : '?') + 'token=' + token, '_blank');
   };
 
+  // Handle text selection in the document view
+  const handleMouseUp = useCallback(() => {
+    const sel = window.getSelection();
+    const text = sel?.toString()?.trim();
+    if (text && text.length > 0 && docRef.current?.contains(sel?.anchorNode)) {
+      setSelectedText(text);
+      // Position the floating button near the selection
+      const range = sel.getRangeAt(0);
+      const rect = range.getBoundingClientRect();
+      const containerRect = docRef.current.getBoundingClientRect();
+      setSelectionPos({
+        top: rect.top - containerRect.top - 40,
+        left: Math.min(rect.left - containerRect.left + rect.width / 2, containerRect.width - 100)
+      });
+    } else {
+      // Don't clear selection if the proposal form is open
+      if (!showProposalForm) {
+        setSelectedText('');
+        setSelectionPos(null);
+      }
+    }
+  }, [showProposalForm]);
+
+  const openProposalWithSelection = () => {
+    setShowProposalForm(true);
+    setSelectionPos(null);
+  };
+
   if (error && !contract) return <div className="card"><div className="card-body"><p style={{ color: 'var(--danger)' }}>{error}</p></div></div>;
   if (!contract) return <div className="flex-center" style={{ padding: 60 }}>Loading...</div>;
 
   const canEdit = user?.role === 'admin' || user?.role === 'editor';
+  // Combine all sections into one document text
+  const fullText = contract.sections.map(s => s.content).join('\n\n');
+  const firstSection = contract.sections[0];
 
   return (
     <div>
@@ -83,6 +105,7 @@ export default function ContractDetail() {
         </div>
         <div className="flex gap-2">
           {canEdit && <button className="btn btn-outline btn-sm" onClick={() => setShowVersionForm(true)}>Save Version</button>}
+          {canEdit && contract.file_path && <button className="btn btn-outline btn-sm" onClick={handleReparse}>Re-parse</button>}
           <div style={{ position: 'relative', display: 'inline-block' }}>
             <ExportMenu onExport={handleExport} />
           </div>
@@ -93,7 +116,7 @@ export default function ContractDetail() {
       {error && <div className="login-error mb-4">{error}</div>}
 
       <div className="tabs">
-        <button className={`tab ${activeTab === 'sections' ? 'active' : ''}`} onClick={() => setActiveTab('sections')}>Sections</button>
+        <button className={`tab ${activeTab === 'document' ? 'active' : ''}`} onClick={() => setActiveTab('document')}>Document</button>
         <button className={`tab ${activeTab === 'proposals' ? 'active' : ''}`} onClick={() => setActiveTab('proposals')}>
           Proposals ({proposals.length})
         </button>
@@ -102,60 +125,67 @@ export default function ContractDetail() {
         </button>
       </div>
 
-      {activeTab === 'sections' && (
+      {activeTab === 'document' && (
         <div>
-          {canEdit && !editing && (
-            <div className="flex gap-2 mb-3">
-              <button className="btn btn-outline btn-sm" onClick={() => setEditing(true)}>Edit Sections</button>
-              {contract.file_path && <button className="btn btn-outline btn-sm" onClick={handleReparse}>Re-parse from File</button>}
+          {canEdit && (
+            <div style={{ background: 'var(--gray-50)', border: '1px solid var(--gray-200)', borderRadius: 'var(--radius)', padding: '10px 16px', marginBottom: 16, fontSize: 14, color: 'var(--gray-600)' }}>
+              Highlight text in the document below, then click <strong>"Propose Amendment"</strong> to create a change proposal for the selected clause(s).
             </div>
           )}
-          {editing ? (
-            <div className="card">
-              <div className="card-body">
-                {editSections.map((s, i) => (
-                  <div key={i} style={{ border: '1px solid var(--gray-200)', borderRadius: 'var(--radius)', padding: 16, marginBottom: 12 }}>
-                    <div className="flex gap-2 mb-3">
-                      <input className="form-control" value={s.section_number} onChange={e => { const ns = [...editSections]; ns[i].section_number = e.target.value; setEditSections(ns); }} style={{ maxWidth: 100 }} placeholder="#" />
-                      <input className="form-control" value={s.title || ''} onChange={e => { const ns = [...editSections]; ns[i].title = e.target.value; setEditSections(ns); }} placeholder="Title" />
-                      <button className="btn btn-ghost btn-sm" onClick={() => setEditSections(editSections.filter((_, idx) => idx !== i))}>&#x2715;</button>
-                    </div>
-                    <textarea className="form-control" value={s.content} onChange={e => { const ns = [...editSections]; ns[i].content = e.target.value; setEditSections(ns); }} rows={4} />
-                  </div>
-                ))}
-                <div className="flex gap-2">
-                  <button className="btn btn-outline btn-sm" onClick={() => setEditSections([...editSections, { section_number: String(editSections.length + 1), title: '', content: '' }])}>+ Add Section</button>
-                </div>
-              </div>
-              <div className="card-footer">
-                <button className="btn btn-outline" onClick={() => { setEditing(false); setEditSections(contract.sections.map(s => ({ ...s }))); }}>Cancel</button>
-                <button className="btn btn-primary" onClick={handleSaveSections}>Save Changes</button>
+          <div className="card">
+            <div className="card-body" style={{ position: 'relative' }}>
+              {/* Floating "Propose Amendment" button appears when text is selected */}
+              {canEdit && selectionPos && selectedText && (
+                <button
+                  className="btn btn-primary btn-sm"
+                  style={{
+                    position: 'absolute',
+                    top: selectionPos.top,
+                    left: selectionPos.left,
+                    zIndex: 20,
+                    boxShadow: 'var(--shadow-md)',
+                    transform: 'translateX(-50%)',
+                    whiteSpace: 'nowrap'
+                  }}
+                  onMouseDown={e => e.preventDefault()}
+                  onClick={openProposalWithSelection}
+                >
+                  Propose Amendment
+                </button>
+              )}
+              <div
+                ref={docRef}
+                onMouseUp={handleMouseUp}
+                style={{
+                  whiteSpace: 'pre-wrap',
+                  lineHeight: 1.8,
+                  fontFamily: '"Courier New", Courier, monospace',
+                  fontSize: 13,
+                  maxHeight: '70vh',
+                  overflow: 'auto',
+                  padding: '8px 0',
+                  cursor: 'text',
+                  userSelect: 'text'
+                }}
+              >
+                {fullText}
               </div>
             </div>
-          ) : (
-            <div>
-              {contract.sections.map(s => (
-                <div key={s.id} className="card mb-3" id={`section-${s.id}`}>
-                  <div className="card-header">
-                    <h3>{s.section_number}{/\d$/.test(s.section_number) ? '.' : ''} {s.title || 'Untitled Section'}</h3>
-                    {canEdit && (
-                      <button className="btn btn-primary btn-sm" onClick={() => { setSelectedSection(s); setShowProposalForm(true); }}>
-                        Propose Change
-                      </button>
-                    )}
-                  </div>
-                  <div className="card-body">
-                    <p style={{ whiteSpace: 'pre-wrap', lineHeight: 1.7 }}>{s.content}</p>
-                    {proposals.filter(p => p.section_id === s.id).length > 0 && (
-                      <div style={{ marginTop: 16, paddingTop: 16, borderTop: '1px solid var(--gray-200)' }}>
-                        <strong className="text-sm">Active Proposals:</strong>
-                        {proposals.filter(p => p.section_id === s.id).map(p => (
-                          <div key={p.id} className="flex-between" style={{ padding: '6px 0' }}>
-                            <Link to={`/proposals/${p.id}`} className="text-sm">{p.title}</Link>
-                            <span className={`status-badge status-${p.status}`}>{p.status.replace('_', ' ')}</span>
-                          </div>
-                        ))}
-                      </div>
+          </div>
+          {proposals.length > 0 && (
+            <div style={{ marginTop: 24 }}>
+              <h3 style={{ fontSize: 16, fontWeight: 600, marginBottom: 12 }}>Active Proposals</h3>
+              {proposals.map(p => (
+                <div key={p.id} className="card mb-2">
+                  <div className="card-body" style={{ padding: '12px 16px' }}>
+                    <div className="flex-between">
+                      <Link to={`/proposals/${p.id}`} style={{ fontWeight: 600 }}>{p.title}</Link>
+                      <span className={`status-badge status-${p.status}`}>{p.status.replace('_', ' ')}</span>
+                    </div>
+                    {p.original_text && (
+                      <p className="text-sm text-muted" style={{ marginTop: 4 }}>
+                        Amending: "{p.original_text.substring(0, 100)}{p.original_text.length > 100 ? '...' : ''}"
+                      </p>
                     )}
                   </div>
                 </div>
@@ -167,19 +197,18 @@ export default function ContractDetail() {
 
       {activeTab === 'proposals' && (
         <div>
-          {canEdit && <button className="btn btn-primary btn-sm mb-3" onClick={() => { setSelectedSection(null); setShowProposalForm(true); }}>+ New Proposal</button>}
+          {canEdit && <button className="btn btn-primary btn-sm mb-3" onClick={() => { setSelectedText(''); setShowProposalForm(true); }}>+ New Proposal</button>}
           {proposals.length === 0 ? (
-            <div className="card"><div className="card-body empty-state"><h3>No proposals yet</h3></div></div>
+            <div className="card"><div className="card-body empty-state"><h3>No proposals yet</h3><p className="text-muted">Highlight text in the Document tab to propose amendments</p></div></div>
           ) : (
             <div className="card">
               <div className="table-container">
                 <table>
-                  <thead><tr><th>Title</th><th>Section</th><th>Status</th><th>Proposer</th><th>Feedback</th><th>Date</th></tr></thead>
+                  <thead><tr><th>Title</th><th>Status</th><th>Proposer</th><th>Feedback</th><th>Date</th></tr></thead>
                   <tbody>
                     {proposals.map(p => (
                       <tr key={p.id}>
                         <td><Link to={`/proposals/${p.id}`} style={{ fontWeight: 600 }}>{p.title}</Link></td>
-                        <td className="text-sm">{p.section_number ? `${p.section_number}. ${p.section_title || ''}` : 'N/A'}</td>
                         <td><span className={`status-badge status-${p.status}`}>{p.status.replace('_', ' ')}</span></td>
                         <td className="text-sm">{p.proposer_name}</td>
                         <td className="text-sm">{p.feedback_count} comments</td>
@@ -235,11 +264,11 @@ export default function ContractDetail() {
       {showProposalForm && (
         <ProposalFormModal
           contractId={id}
-          section={selectedSection}
-          sections={contract.sections}
+          sectionId={firstSection?.id}
+          initialOriginalText={selectedText}
           templates={templates}
-          onClose={() => { setShowProposalForm(false); setSelectedSection(null); }}
-          onCreated={() => { setShowProposalForm(false); setSelectedSection(null); loadProposals(); }}
+          onClose={() => { setShowProposalForm(false); }}
+          onCreated={() => { setShowProposalForm(false); setSelectedText(''); setSelectionPos(null); loadProposals(); }}
         />
       )}
 
@@ -271,24 +300,14 @@ function ExportMenu({ onExport }) {
   );
 }
 
-function ProposalFormModal({ contractId, section, sections, templates, onClose, onCreated }) {
+function ProposalFormModal({ contractId, sectionId, initialOriginalText, templates, onClose, onCreated }) {
   const [title, setTitle] = useState('');
-  const [sectionId, setSectionId] = useState(section?.id || '');
-  const [originalText, setOriginalText] = useState(section?.content || '');
-  const [proposedText, setProposedText] = useState(section?.content || '');
+  const [originalText, setOriginalText] = useState(initialOriginalText || '');
+  const [proposedText, setProposedText] = useState(initialOriginalText || '');
   const [rationale, setRationale] = useState('');
   const [priority, setPriority] = useState('medium');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
-
-  const handleSectionChange = (secId) => {
-    setSectionId(secId);
-    const sec = sections.find(s => String(s.id) === String(secId));
-    if (sec) {
-      setOriginalText(sec.content);
-      setProposedText(sec.content);
-    }
-  };
 
   const applyTemplate = (template) => {
     setTitle(template.name);
@@ -301,7 +320,15 @@ function ProposalFormModal({ contractId, section, sections, templates, onClose, 
     setLoading(true);
     setError('');
     try {
-      await api.createProposal({ contract_id: contractId, section_id: sectionId || null, title, original_text: originalText, proposed_text: proposedText, rationale, priority });
+      await api.createProposal({
+        contract_id: contractId,
+        section_id: sectionId || null,
+        title,
+        original_text: originalText,
+        proposed_text: proposedText,
+        rationale,
+        priority
+      });
       onCreated();
     } catch (err) { setError(err.message); }
     setLoading(false);
@@ -309,7 +336,7 @@ function ProposalFormModal({ contractId, section, sections, templates, onClose, 
 
   return (
     <div className="modal-overlay" onClick={onClose}>
-      <div className="modal" onClick={e => e.stopPropagation()} style={{ maxWidth: 900 }}>
+      <div className="modal" onClick={e => e.stopPropagation()} style={{ maxWidth: 960 }}>
         <div className="modal-header">
           <h2>Propose Amendment</h2>
           <button className="btn-ghost" onClick={onClose}>&#x2715;</button>
@@ -320,7 +347,7 @@ function ProposalFormModal({ contractId, section, sections, templates, onClose, 
             <div className="flex gap-3">
               <div className="form-group" style={{ flex: 2 }}>
                 <label>Title *</label>
-                <input className="form-control" value={title} onChange={e => setTitle(e.target.value)} required placeholder="Amendment title" />
+                <input className="form-control" value={title} onChange={e => setTitle(e.target.value)} required placeholder="e.g. Update Section 1.2 - Contractor Responsibilities" />
               </div>
               <div className="form-group" style={{ flex: 1 }}>
                 <label>Priority</label>
@@ -328,13 +355,6 @@ function ProposalFormModal({ contractId, section, sections, templates, onClose, 
                   <option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option><option value="critical">Critical</option>
                 </select>
               </div>
-            </div>
-            <div className="form-group">
-              <label>Section</label>
-              <select className="form-control" value={sectionId} onChange={e => handleSectionChange(e.target.value)}>
-                <option value="">-- Select Section --</option>
-                {sections.map(s => <option key={s.id} value={s.id}>{s.section_number}. {s.title || 'Untitled'}</option>)}
-              </select>
             </div>
             {templates.length > 0 && (
               <div className="form-group">
@@ -347,12 +367,30 @@ function ProposalFormModal({ contractId, section, sections, templates, onClose, 
             )}
             <div className="diff-container mb-3">
               <div className="diff-side">
-                <div className="diff-side-header">Original Text</div>
-                <div style={{ padding: 8 }}><textarea className="form-control" value={originalText} onChange={e => setOriginalText(e.target.value)} rows={8} placeholder="Original contract text" /></div>
+                <div className="diff-side-header">Original Text (from contract)</div>
+                <div style={{ padding: 8 }}>
+                  <textarea
+                    className="form-control"
+                    value={originalText}
+                    onChange={e => setOriginalText(e.target.value)}
+                    rows={12}
+                    placeholder="Paste or highlight text from the contract document"
+                    style={{ fontFamily: '"Courier New", Courier, monospace', fontSize: 13, lineHeight: 1.6 }}
+                  />
+                </div>
               </div>
               <div className="diff-side">
-                <div className="diff-side-header">Proposed Text</div>
-                <div style={{ padding: 8 }}><textarea className="form-control" value={proposedText} onChange={e => setProposedText(e.target.value)} rows={8} placeholder="Your proposed changes" /></div>
+                <div className="diff-side-header">Proposed Text (your changes)</div>
+                <div style={{ padding: 8 }}>
+                  <textarea
+                    className="form-control"
+                    value={proposedText}
+                    onChange={e => setProposedText(e.target.value)}
+                    rows={12}
+                    placeholder="Edit this text to show your proposed changes"
+                    style={{ fontFamily: '"Courier New", Courier, monospace', fontSize: 13, lineHeight: 1.6 }}
+                  />
+                </div>
               </div>
             </div>
             <div className="form-group">

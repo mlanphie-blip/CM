@@ -114,46 +114,32 @@ router.post('/', authenticate, requireRole('admin', 'editor'), upload.single('fi
 
     const contractId = result.lastInsertRowid;
 
-    // Parse and insert sections — chain of parsers from most to least accurate:
-    // 1. DOCX XML parser (reads numbering.xml for exact Word numbering)
-    // 2. HTML parser (mammoth HTML → sections from <ol>/<li> structure)
-    // 3. Text parser (regex pattern matching on raw text)
+    // Parse contract into a single full-text document with Word numbering preserved.
+    // The entire contract is stored as one section so the user can highlight any
+    // text to propose amendments.  Numbering from Word outline lists is computed
+    // from the DOCX XML so it appears exactly as in the original document.
     let sections;
     try {
       if (manualSections.length > 0) {
         sections = manualSections;
       } else if (extractedText.type === 'docx') {
-        // Try direct DOCX XML parsing first (most accurate numbering)
-        console.log('[Parser] Trying DOCX XML parser on:', req.file.path);
-        sections = await parseSectionsFromDocxXml(req.file.path);
-        if (sections) {
-          console.log('[Parser] DOCX XML parser succeeded:', sections.length, 'sections');
+        console.log('[Parser] Extracting full text with numbering from:', req.file.path);
+        const fullDoc = await extractFullTextWithNumbering(req.file.path);
+        if (fullDoc) {
+          console.log('[Parser] Extracted', fullDoc.length, 'chars with numbering');
+          sections = [{ number: '1', title: 'Full Contract', content: fullDoc }];
+        } else {
+          // Fallback: use mammoth raw text (numbers may be missing for outline lists)
+          console.log('[Parser] DOCX extraction returned null, using mammoth raw text');
+          sections = [{ number: '1', title: 'Full Contract', content: extractedText.text || '' }];
         }
-        // Fall back to HTML-based parsing
-        if (!sections && extractedText.html) {
-          console.log('[Parser] DOCX XML failed, falling back to HTML parser');
-          sections = parseSectionsFromHtml(extractedText.html);
-          if (sections) console.log('[Parser] HTML parser produced:', sections.length, 'sections');
-        }
-        // Fall back to text-based parsing
-        if (!sections) {
-          console.log('[Parser] Falling back to text parser');
-          sections = parseTextIntoSections(extractedText.text);
-          console.log('[Parser] Text parser produced:', sections.length, 'sections');
-        }
-        // Debug: save parsed sections for diagnostics
-        try {
-          const debugDir = path.join(__dirname, '..', '..', 'data');
-          if (!fs.existsSync(debugDir)) fs.mkdirSync(debugDir, { recursive: true });
-          fs.writeFileSync(path.join(debugDir, 'debug_parsed_sections.json'), JSON.stringify(sections, null, 2));
-        } catch (debugErr) { /* ignore */ }
       } else {
-        sections = parseTextIntoSections(extractedText.text || (typeof extractedText === 'string' ? extractedText : ''));
+        sections = [{ number: '1', title: 'Full Contract', content: extractedText.text || (typeof extractedText === 'string' ? extractedText : '') }];
       }
     } catch (parseErr) {
-      console.error('Section parsing error:', parseErr.message, parseErr.stack);
+      console.error('Text extraction error:', parseErr.message, parseErr.stack);
       const fallbackText = extractedText.text || (typeof extractedText === 'string' ? extractedText : '');
-      sections = [{ number: '1', title: 'Main Content', content: fallbackText }];
+      sections = [{ number: '1', title: 'Full Contract', content: fallbackText }];
     }
 
     const insertSection = db.prepare(`
@@ -370,6 +356,238 @@ async function extractTextFromFile(filePath, fileType) {
     return { text: fs.readFileSync(filePath, 'utf-8'), html: null, type: 'txt' };
   }
   return { text: '', html: null, type: fileType };
+}
+
+// ---- Full-text extraction with Word numbering ----
+// Reads the DOCX ZIP directly to compute the exact auto-numbering that Word
+// displays, then returns the entire document as a single formatted string.
+// Each numbered paragraph is prefixed with its computed number (e.g. "1.2.1").
+// Non-numbered paragraphs appear as-is.  The result preserves the exact
+// reading order of the document so the user sees the contract as written.
+async function extractFullTextWithNumbering(filePath) {
+  let JSZip, DOMParser;
+  try {
+    JSZip = require('jszip');
+    DOMParser = require('@xmldom/xmldom').DOMParser;
+  } catch (err) {
+    console.error('extractFullTextWithNumbering: missing dependency:', err.message);
+    return null;
+  }
+
+  let zip;
+  try {
+    const data = fs.readFileSync(filePath);
+    zip = await JSZip.loadAsync(data);
+  } catch (err) {
+    console.error('extractFullTextWithNumbering: failed to read DOCX ZIP:', err.message);
+    return null;
+  }
+
+  const parser = new DOMParser();
+
+  // ---- 1. Parse numbering.xml ----
+  const numXmlStr = await zip.file('word/numbering.xml')?.async('string');
+  const numDoc = numXmlStr ? parser.parseFromString(numXmlStr, 'text/xml') : null;
+
+  const abstractDefs = {};
+  if (numDoc) {
+    const abstractNums = numDoc.getElementsByTagName('w:abstractNum');
+    for (let i = 0; i < abstractNums.length; i++) {
+      const an = abstractNums[i];
+      const id = an.getAttribute('w:abstractNumId');
+      const levels = {};
+      for (let c = an.firstChild; c; c = c.nextSibling) {
+        if (c.nodeName !== 'w:lvl') continue;
+        const ilvl = parseInt(c.getAttribute('w:ilvl'), 10);
+        const startEl = getDirectChild(c, 'w:start');
+        const fmtEl = getDirectChild(c, 'w:numFmt');
+        const txtEl = getDirectChild(c, 'w:lvlText');
+        levels[ilvl] = {
+          start: parseInt(startEl?.getAttribute('w:val') || '1', 10),
+          numFmt: fmtEl?.getAttribute('w:val') || 'decimal',
+          lvlText: txtEl?.getAttribute('w:val') || ''
+        };
+      }
+      abstractDefs[id] = { levels };
+    }
+  }
+
+  const numDefs = {};
+  if (numDoc) {
+    const nums = numDoc.getElementsByTagName('w:num');
+    for (let i = 0; i < nums.length; i++) {
+      const num = nums[i];
+      const numId = num.getAttribute('w:numId');
+      const abstractRefEl = getDirectChild(num, 'w:abstractNumId');
+      const abstractRef = abstractRefEl?.getAttribute('w:val');
+      if (!abstractRef || !abstractDefs[abstractRef]) continue;
+      const levels = {};
+      for (const [lvl, def] of Object.entries(abstractDefs[abstractRef].levels)) {
+        levels[lvl] = { ...def };
+      }
+      for (let c = num.firstChild; c; c = c.nextSibling) {
+        if (c.nodeName !== 'w:lvlOverride') continue;
+        const ilvl = parseInt(c.getAttribute('w:ilvl'), 10);
+        const startOvr = getDirectChild(c, 'w:startOverride');
+        if (startOvr && levels[ilvl]) {
+          levels[ilvl].start = parseInt(startOvr.getAttribute('w:val'), 10);
+        }
+      }
+      numDefs[numId] = { levels };
+    }
+  }
+
+  // ---- 2. Parse styles.xml for style-based numbering ----
+  const styleNumMap = {};
+  const stylesXmlStr = await zip.file('word/styles.xml')?.async('string');
+  if (stylesXmlStr) {
+    const stylesDoc = parser.parseFromString(stylesXmlStr, 'text/xml');
+    const styles = stylesDoc.getElementsByTagName('w:style');
+    for (let i = 0; i < styles.length; i++) {
+      const style = styles[i];
+      const styleId = style.getAttribute('w:styleId');
+      const pPr = getDirectChild(style, 'w:pPr');
+      if (!pPr) continue;
+      const numPr = getDirectChild(pPr, 'w:numPr');
+      if (!numPr) continue;
+      const numIdEl = getDirectChild(numPr, 'w:numId');
+      const ilvlEl = getDirectChild(numPr, 'w:ilvl');
+      if (numIdEl) {
+        styleNumMap[styleId] = {
+          numId: numIdEl.getAttribute('w:val'),
+          ilvl: parseInt(ilvlEl?.getAttribute('w:val') || '0', 10)
+        };
+      }
+    }
+  }
+
+  // ---- 3. Parse document.xml and build formatted text ----
+  const docXmlStr = await zip.file('word/document.xml')?.async('string');
+  if (!docXmlStr) return null;
+
+  const docDoc = parser.parseFromString(docXmlStr, 'text/xml');
+  const pElements = docDoc.getElementsByTagName('w:p');
+
+  const counters = {};
+  const lines = [];
+
+  function formatNumber(val, fmt) {
+    switch (fmt) {
+      case 'upperRoman': return toRoman(val);
+      case 'lowerRoman': return toRoman(val).toLowerCase();
+      case 'upperLetter': return val > 0 && val <= 26 ? String.fromCharCode(64 + val) : String(val);
+      case 'lowerLetter': return val > 0 && val <= 26 ? String.fromCharCode(96 + val) : String(val);
+      case 'decimal': default: return String(val);
+    }
+  }
+
+  function toRoman(num) {
+    const vals = [1000, 900, 500, 400, 100, 90, 50, 40, 10, 9, 5, 4, 1];
+    const syms = ['M', 'CM', 'D', 'CD', 'C', 'XC', 'L', 'XL', 'X', 'IX', 'V', 'IV', 'I'];
+    let result = '';
+    for (let i = 0; i < vals.length; i++) {
+      while (num >= vals[i]) { result += syms[i]; num -= vals[i]; }
+    }
+    return result;
+  }
+
+  function computeNumberText(numId, level) {
+    const def = numDefs[numId];
+    if (!def) return '';
+    const lvlDef = def.levels[level];
+    if (!lvlDef || lvlDef.numFmt === 'bullet' || lvlDef.numFmt === 'none') return '';
+    let text = lvlDef.lvlText;
+    for (let l = 0; l <= level; l++) {
+      const val = counters[numId]?.[l] || 0;
+      const fmt = def.levels[l]?.numFmt || 'decimal';
+      text = text.replace('%' + (l + 1), formatNumber(val, fmt));
+    }
+    return text;
+  }
+
+  for (let i = 0; i < pElements.length; i++) {
+    const p = pElements[i];
+
+    // Get text
+    let text = '';
+    const runs = p.getElementsByTagName('w:t');
+    for (let j = 0; j < runs.length; j++) {
+      text += runs[j].textContent || '';
+    }
+    text = text.trim();
+
+    // Resolve numbering
+    let numId = null, ilvl = null;
+    const pPr = getDirectChild(p, 'w:pPr');
+    if (pPr) {
+      const numPr = getDirectChild(pPr, 'w:numPr');
+      if (numPr) {
+        const numIdEl = getDirectChild(numPr, 'w:numId');
+        const ilvlEl = getDirectChild(numPr, 'w:ilvl');
+        if (numIdEl) {
+          numId = numIdEl.getAttribute('w:val');
+          ilvl = parseInt(ilvlEl?.getAttribute('w:val') || '0', 10);
+        }
+      }
+      if (!numId) {
+        const pStyleEl = getDirectChild(pPr, 'w:pStyle');
+        if (pStyleEl) {
+          const sid = pStyleEl.getAttribute('w:val');
+          if (styleNumMap[sid]) {
+            numId = styleNumMap[sid].numId;
+            ilvl = styleNumMap[sid].ilvl;
+          }
+        }
+      }
+    }
+    if (numId === '0') { numId = null; ilvl = null; }
+
+    // Compute number prefix
+    let prefix = '';
+    if (numId && numDefs[numId]) {
+      const def = numDefs[numId];
+      const level = ilvl ?? 0;
+      const fmt = def.levels[level]?.numFmt;
+
+      if (fmt === 'bullet') {
+        prefix = '  '.repeat(level) + '• ';
+      } else if (fmt === 'none') {
+        // no prefix
+      } else {
+        if (!counters[numId]) {
+          counters[numId] = {};
+          for (const [lvl, lvlDef] of Object.entries(def.levels)) {
+            counters[numId][lvl] = lvlDef.start - 1;
+          }
+        }
+        const ctr = counters[numId];
+        if (ctr[level] === undefined) ctr[level] = (def.levels[level]?.start || 1) - 1;
+        ctr[level]++;
+        for (const lvl of Object.keys(ctr)) {
+          if (parseInt(lvl, 10) > level) {
+            ctr[lvl] = (def.levels[lvl]?.start || 1) - 1;
+          }
+        }
+        const numText = computeNumberText(numId, level);
+        // Indent sub-levels for readability
+        const indent = '  '.repeat(level);
+        prefix = indent + numText + ' ';
+      }
+    }
+
+    if (text || lines.length > 0) {
+      // Blank lines → paragraph break
+      if (!text) {
+        lines.push('');
+      } else {
+        lines.push(prefix + text);
+      }
+    }
+  }
+
+  // Collapse runs of 3+ blank lines down to 2
+  const result = lines.join('\n').replace(/\n{4,}/g, '\n\n\n').trim();
+  return result || null;
 }
 
 // ---- Section Parsing Engine ----
@@ -1269,7 +1487,7 @@ function toTitleCase(str) {
   return str.toLowerCase().replace(/(?:^|\s|[-/])\S/g, c => c.toUpperCase());
 }
 
-// Re-parse a single DOCX contract's sections in the database using the latest parser
+// Re-parse a single DOCX contract using the full-text extractor
 async function reparseContract(contractId) {
   const db = getDb();
   const contract = db.prepare('SELECT * FROM contracts WHERE id = ?').get(contractId);
@@ -1282,21 +1500,20 @@ async function reparseContract(contractId) {
     return { success: false, reason: 'File not found: ' + fullPath };
   }
 
-  let sections = await parseSectionsFromDocxXml(fullPath);
-  if (!sections || sections.length <= 1) {
-    // Fall back to HTML parser
+  let fullText = await extractFullTextWithNumbering(fullPath);
+  if (!fullText) {
+    // Fallback to mammoth raw text
     try {
       const mammoth = require('mammoth');
-      const htmlResult = await mammoth.convertToHtml({ path: fullPath });
-      sections = parseSectionsFromHtml(htmlResult.value);
+      const textResult = await mammoth.extractRawText({ path: fullPath });
+      fullText = textResult.value;
     } catch (err) {
-      console.error('[Reparse] HTML fallback failed for contract', contractId, err.message);
+      console.error('[Reparse] mammoth fallback failed for contract', contractId, err.message);
+      return { success: false, reason: 'Text extraction failed' };
     }
   }
 
-  if (!sections || sections.length <= 1) {
-    return { success: false, reason: 'Parser returned too few sections' };
-  }
+  const sections = [{ number: '1', title: 'Full Contract', content: fullText }];
 
   // Replace sections in the database
   db.prepare('DELETE FROM contract_sections WHERE contract_id = ?').run(contractId);
