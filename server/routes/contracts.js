@@ -600,9 +600,15 @@ async function parseSectionsFromDocxXml(filePath) {
   dbg(`Paragraphs with outline levels: ${paragraphs.filter(p => p.outlineLevel !== null).length}`);
   dbg(`Paragraphs that are bold: ${paragraphs.filter(p => p.isBold && p.text).length}`);
 
-  // ---- 4. Compute actual numbers ----
+  // ---- 4. Classify every paragraph, then assemble sections ----
+  // Strategy:
+  //   a) Find exhibit/attachment boundaries (bold text matching EXHIBIT, SCHEDULE, etc.)
+  //   b) Everything before the first exhibit = one "Preamble" section
+  //   c) Each exhibit heading = its own section
+  //   d) Numbered items within exhibits = individual sections with exact Word numbering
+  //   e) Non-numbered, non-exhibit text appends to the most recent section
+
   const counters = {}; // { numId: { level: currentCount } }
-  const sections = [];
 
   function formatNumber(val, fmt) {
     switch (fmt) {
@@ -631,13 +637,11 @@ async function parseSectionsFromDocxXml(filePath) {
     if (!lvlDef || lvlDef.numFmt === 'bullet' || lvlDef.numFmt === 'none') return '';
 
     let text = lvlDef.lvlText;
-    // Replace %1, %2, %3, etc. with actual counter values
     for (let l = 0; l <= level; l++) {
       const val = counters[numId]?.[l] || 0;
       const fmt = def.levels[l]?.numFmt || 'decimal';
       text = text.replace('%' + (l + 1), formatNumber(val, fmt));
     }
-    // Strip trailing dots/periods for cleaner display
     return text.replace(/\.+$/, '');
   }
 
@@ -647,95 +651,173 @@ async function parseSectionsFromDocxXml(filePath) {
     return firstLine.length <= 120 ? firstLine : firstLine.substring(0, 117) + '...';
   }
 
-  // Detect exhibit/appendix/schedule headings
+  // Detect exhibit/appendix/schedule/SOW headings
+  const exhibitRe = /^(EXHIBIT|SCHEDULE|APPENDIX|ANNEX|ATTACHMENT)\s+[A-Z0-9]/i;
   function isExhibitHeading(text) {
-    return /^(EXHIBIT|SCHEDULE|APPENDIX|ANNEX|ATTACHMENT|STATEMENT OF WORK|SCOPE OF WORK)\s+[A-Z0-9]?/i.test(text.trim());
+    return exhibitRe.test(text.trim());
   }
 
+  // ---- Pass 1: Classify each paragraph ----
+  const classified = [];
   for (let pi = 0; pi < paragraphs.length; pi++) {
     const para = paragraphs[pi];
     if (!para.text) continue;
 
-    // ---- Numbered paragraph ----
+    let kind = 'body'; // default: plain body text
+    let numberText = '';
+
+    // Check if this is a numbered paragraph
     if (para.numId && numDefs[para.numId]) {
       const def = numDefs[para.numId];
       const level = para.ilvl;
-      const isBulletLevel = def.levels[level]?.numFmt === 'bullet' || def.levels[level]?.numFmt === 'none';
-
-      if (isBulletLevel) {
-        // Bullet items are content, not numbered sections
-        if (sections.length > 0) {
-          const last = sections[sections.length - 1];
-          last.content += (last.content ? '\n' : '') + '- ' + para.text;
+      const fmt = def.levels[level]?.numFmt;
+      if (fmt === 'bullet' || fmt === 'none') {
+        kind = 'bullet';
+      } else {
+        // Initialize counters
+        if (!counters[para.numId]) {
+          counters[para.numId] = {};
+          for (const [lvl, lvlDef] of Object.entries(def.levels)) {
+            counters[para.numId][lvl] = lvlDef.start - 1;
+          }
         }
-        continue;
-      }
-
-      // Initialize counters for this numId if needed
-      if (!counters[para.numId]) {
-        counters[para.numId] = {};
-        for (const [lvl, lvlDef] of Object.entries(def.levels)) {
-          counters[para.numId][lvl] = lvlDef.start - 1;
+        const ctr = counters[para.numId];
+        if (ctr[level] === undefined) ctr[level] = (def.levels[level]?.start || 1) - 1;
+        ctr[level]++;
+        for (const lvl of Object.keys(ctr)) {
+          if (parseInt(lvl, 10) > level) {
+            ctr[lvl] = (def.levels[lvl]?.start || 1) - 1;
+          }
         }
+        numberText = computeNumberText(para.numId, level);
+        kind = 'numbered';
+        dbg(`  [${pi}] NUMBERED numId=${para.numId} ilvl=${level} → "${numberText}" | ${para.text.substring(0, 80)}`);
       }
+    }
 
-      const ctr = counters[para.numId];
-
-      // Increment counter at this level
-      if (ctr[level] === undefined) ctr[level] = (def.levels[level]?.start || 1) - 1;
-      ctr[level]++;
-
-      // Reset all deeper level counters
-      for (const lvl of Object.keys(ctr)) {
-        if (parseInt(lvl, 10) > level) {
-          ctr[lvl] = (def.levels[lvl]?.start || 1) - 1;
-        }
+    // Check if exhibit heading (bold, matches exhibit pattern)
+    if (kind === 'body' && isExhibitHeading(para.text)) {
+      kind = 'exhibit';
+      dbg(`  [${pi}] EXHIBIT HEADING | ${para.text.substring(0, 80)}`);
+    }
+    // Check if heading style
+    else if (kind === 'body' && para.outlineLevel !== null && para.outlineLevel <= 8) {
+      // Heading styles that match exhibit patterns → exhibit
+      if (isExhibitHeading(para.text)) {
+        kind = 'exhibit';
+        dbg(`  [${pi}] EXHIBIT HEADING (outline) | ${para.text.substring(0, 80)}`);
+      } else {
+        kind = 'heading';
+        dbg(`  [${pi}] HEADING outlineLevel=${para.outlineLevel} | ${para.text.substring(0, 80)}`);
       }
+    }
+    // Check if bold short text (but NOT an exhibit)
+    else if (kind === 'body' && para.isBold && para.text.length <= 200) {
+      kind = 'bold';
+      dbg(`  [${pi}] BOLD | ${para.text.substring(0, 80)}`);
+    }
 
-      const numberText = computeNumberText(para.numId, level);
-      dbg(`  [${pi}] NUMBERED numId=${para.numId} ilvl=${level} → "${numberText}" | ${para.text.substring(0, 60)}`);
+    classified.push({ ...para, kind, numberText, pi });
+  }
 
+  // ---- Pass 2: Find the first exhibit boundary ----
+  let firstExhibitIdx = classified.findIndex(c => c.kind === 'exhibit');
+  dbg(`First exhibit paragraph index: ${firstExhibitIdx} (of ${classified.length} classified)`);
+
+  // ---- Pass 3: Assemble sections ----
+  const sections = [];
+
+  // 3a. Everything before the first exhibit → one "Preamble" section
+  if (firstExhibitIdx === -1) firstExhibitIdx = classified.length; // no exhibits at all
+
+  if (firstExhibitIdx > 0) {
+    let preambleContent = '';
+    for (let i = 0; i < firstExhibitIdx; i++) {
+      const c = classified[i];
+      if (!c.text) continue;
+      // For bold headings in the preamble, include them as bold markers in the content
+      if (c.kind === 'bold' || c.kind === 'heading') {
+        preambleContent += (preambleContent ? '\n\n' : '') + c.text;
+      } else if (c.kind === 'numbered') {
+        preambleContent += (preambleContent ? '\n' : '') + (c.numberText ? c.numberText + '. ' : '') + c.text;
+      } else if (c.kind === 'bullet') {
+        preambleContent += (preambleContent ? '\n' : '') + '- ' + c.text;
+      } else {
+        preambleContent += (preambleContent ? '\n' : '') + c.text;
+      }
+    }
+    if (preambleContent.trim()) {
       sections.push({
-        number: numberText || String(sections.length + 1),
-        title: (para.isBold && level === 0) ? para.text : makeShortTitle(para.text),
-        content: (para.isBold && level === 0) ? '' : para.text
+        number: 'Preamble',
+        title: 'Amendment Body',
+        content: preambleContent.trim()
       });
+      dbg(`  Created Preamble section (${preambleContent.length} chars)`);
+    }
+  }
 
-    // ---- Heading-styled paragraph (Heading 1, Heading 2, etc.) ----
-    } else if (para.outlineLevel !== null && para.outlineLevel <= 8) {
-      const parsed = parseNumberFromTitle(para.text);
-      dbg(`  [${pi}] HEADING outlineLevel=${para.outlineLevel} style="${para.pStyleId}" → "${parsed.number}" | ${para.text.substring(0, 60)}`);
+  // 3b. Process from the first exhibit onward
+  for (let i = firstExhibitIdx; i < classified.length; i++) {
+    const c = classified[i];
+
+    if (c.kind === 'exhibit') {
+      // Exhibit heading → new section
+      const parsed = parseNumberFromTitle(c.text);
+      sections.push({
+        number: parsed.number || c.text,
+        title: parsed.title || c.text,
+        content: ''
+      });
+      dbg(`  Created EXHIBIT section: [${parsed.number || c.text}] "${(parsed.title || c.text).substring(0, 60)}"`);
+    } else if (c.kind === 'numbered') {
+      // Numbered item → individual section with exact numbering
+      sections.push({
+        number: c.numberText || String(sections.length + 1),
+        title: (c.isBold) ? c.text : makeShortTitle(c.text),
+        content: (c.isBold) ? '' : c.text
+      });
+    } else if (c.kind === 'heading') {
+      // Heading-styled paragraph within exhibit area
+      const parsed = parseNumberFromTitle(c.text);
       sections.push({
         number: parsed.number || String(sections.length + 1),
         title: parsed.title,
         content: ''
       });
-
-    // ---- Non-numbered paragraph ----
-    } else {
-      if (para.isBold && para.text.length <= 200) {
-        // Bold heading (document title, exhibit name, etc.)
-        const parsed = parseNumberFromTitle(para.text);
-        dbg(`  [${pi}] BOLD HEADING → "${parsed.number}" | ${para.text.substring(0, 60)}`);
+    } else if (c.kind === 'bold') {
+      // Bold text within exhibit area — could be sub-exhibit heading
+      // Check if it looks like a structural heading (EXHIBIT, all-caps short text, etc.)
+      if (isExhibitHeading(c.text)) {
+        const parsed = parseNumberFromTitle(c.text);
         sections.push({
-          number: parsed.number || String(sections.length + 1),
-          title: parsed.title,
+          number: parsed.number || c.text,
+          title: parsed.title || c.text,
           content: ''
         });
-      } else if (sections.length > 0) {
-        // Append to most recent section's content
-        const last = sections[sections.length - 1];
-        last.content += (last.content ? '\n' : '') + para.text;
       } else {
-        // Preamble
-        sections.push({ number: '0', title: 'Preamble', content: para.text });
+        // Regular bold text in exhibit area — append to last section
+        if (sections.length > 0) {
+          const last = sections[sections.length - 1];
+          last.content += (last.content ? '\n\n' : '') + c.text;
+        }
+      }
+    } else if (c.kind === 'bullet') {
+      if (sections.length > 0) {
+        const last = sections[sections.length - 1];
+        last.content += (last.content ? '\n' : '') + '- ' + c.text;
+      }
+    } else {
+      // Plain body text → append to last section
+      if (sections.length > 0) {
+        const last = sections[sections.length - 1];
+        last.content += (last.content ? '\n' : '') + c.text;
       }
     }
   }
 
   dbg(`Final section count: ${sections.length}`);
-  for (let i = 0; i < Math.min(sections.length, 50); i++) {
-    dbg(`  Section [${sections[i].number}] "${sections[i].title?.substring(0, 60)}"`);
+  for (let i = 0; i < Math.min(sections.length, 80); i++) {
+    dbg(`  Section [${sections[i].number}] "${(sections[i].title || '').substring(0, 60)}"`);
   }
 
   // Save debug log
@@ -997,8 +1079,8 @@ function parseTextIntoSections(text) {
     { regex: /^(ARTICLE|Article)\s+([IVXLCDM]+|\d+)\.?\s*[-–—:]?\s*(.*)$/i, type: 'article' },
     // "SECTION 1.1" / "Section 3" / "SECTION 10.2.1"
     { regex: /^(SECTION|Section)\s+(\d+(?:\.\d+)*)\.?\s*[-–—:]?\s*(.*)$/i, type: 'section' },
-    // "EXHIBIT A" / "SCHEDULE 1" / "APPENDIX B" / "ANNEX 1"
-    { regex: /^(EXHIBIT|SCHEDULE|APPENDIX|ANNEX|ATTACHMENT)\s+([A-Z0-9]+)\.?\s*[-–—:]?\s*(.*)$/i, type: 'exhibit' },
+    // "EXHIBIT A" / "EXHIBIT B-1" / "SCHEDULE 1" / "APPENDIX B-2" / "ANNEX 1"
+    { regex: /^(EXHIBIT|SCHEDULE|APPENDIX|ANNEX|ATTACHMENT)\s+([A-Z0-9][-A-Z0-9]*)\.?\s*[,.\s]*[-–—:]?\s*(.*)$/i, type: 'exhibit' },
     // Numbered: "1." / "1.1" / "1.1.1" / "12.3" — must be at start of line
     { regex: /^(\d{1,3}(?:\.\d{1,3}){0,4})\.?\s+([A-Z].{0,200})$/, type: 'numbered' },
     // Lettered subsections: "(a)" / "(b)" / "(i)" / "(ii)" — only top-level letters
@@ -1152,11 +1234,22 @@ function parseHeaderInfo(classification) {
 }
 
 function parseNumberFromTitle(rawTitle) {
-  // Try to extract "ARTICLE I - Title" or "Section 1.2 - Title" or "1. Title" from heading text
-  // Check for explicit keywords first
+  // Try to extract structured number/title from heading text
+
+  // EXHIBIT B-1, STATEMENT OF WORK / EXHIBIT A / SCHEDULE 1 / APPENDIX B-2
+  const exhibitMatch = rawTitle.match(/^(EXHIBIT|SCHEDULE|APPENDIX|ANNEX|ATTACHMENT)\s+([A-Z0-9][-A-Z0-9]*)\s*[,.\s]*[-–—:]?\s*(.*)$/i);
+  if (exhibitMatch) {
+    const label = exhibitMatch[1].toUpperCase();
+    const id = exhibitMatch[2].toUpperCase();
+    const rest = exhibitMatch[3]?.trim();
+    return { number: `${label} ${id}`, title: rest || `${label} ${id}` };
+  }
+
+  // ARTICLE I / ARTICLE 1
   const articleMatch = rawTitle.match(/^(?:ARTICLE|Article)\s+([IVXLCDM]+|\d+)\.?\s*[-–—:]?\s*(.*)$/);
   if (articleMatch) return { number: `Art. ${articleMatch[1]}`, title: articleMatch[2].trim() || rawTitle };
 
+  // SECTION 1.1 / Section 3
   const sectionMatch = rawTitle.match(/^(?:SECTION|Section)\s+(\d+(?:\.\d+)*)\.?\s*[-–—:]?\s*(.*)$/);
   if (sectionMatch) return { number: sectionMatch[1], title: sectionMatch[2].trim() || rawTitle };
 
@@ -1254,6 +1347,20 @@ router.post('/:id/reparse', authenticate, requireRole('admin', 'editor'), async 
   } catch (err) {
     console.error('Reparse error:', err);
     res.status(500).json({ error: 'Failed to re-parse: ' + err.message });
+  }
+});
+
+// API endpoint: GET /api/contracts/:id/diagnostics — view parse debug log
+router.get('/:id/diagnostics', authenticate, (req, res) => {
+  try {
+    const debugPath = path.join(__dirname, '..', '..', 'data', 'debug_docx_parse.log');
+    const sectionsPath = path.join(__dirname, '..', '..', 'data', 'debug_parsed_sections.json');
+    const log = fs.existsSync(debugPath) ? fs.readFileSync(debugPath, 'utf-8') : '(no debug log yet)';
+    let sections = [];
+    try { sections = JSON.parse(fs.readFileSync(sectionsPath, 'utf-8')); } catch (e) { /* ignore */ }
+    res.json({ log, sections });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
   }
 });
 
